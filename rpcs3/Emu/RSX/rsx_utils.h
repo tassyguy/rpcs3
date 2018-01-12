@@ -1,7 +1,16 @@
 #pragma once
 
+#include "../System.h"
 #include "gcm_enums.h"
 #include <atomic>
+
+// TODO: replace the code below by #include <optional> when C++17 or newer will be used
+#include <optional.hpp>
+namespace std
+{
+	template<class T>
+	using optional = experimental::optional<T>;
+}
 
 extern "C"
 {
@@ -134,7 +143,7 @@ namespace rsx
 		}
 	}
 
-	void scale_image_nearest(void* dst, const void* src, u16 src_width, u16 src_height, u16 dst_pitch, u16 src_pitch, u8 pixel_size, u8 samples, bool swap_bytes = false);
+	void scale_image_nearest(void* dst, const void* src, u16 src_width, u16 src_height, u16 dst_pitch, u16 src_pitch, u8 pixel_size, u8 samples_u, u8 samples_v, bool swap_bytes = false);
 
 	void convert_scale_image(u8 *dst, AVPixelFormat dst_format, int dst_width, int dst_height, int dst_pitch,
 		const u8 *src, AVPixelFormat src_format, int src_width, int src_height, int src_pitch, int src_slice_h, bool bilinear);
@@ -152,6 +161,38 @@ namespace rsx
 	void fill_viewport_matrix(void *buffer, bool transpose);
 
 	std::array<float, 4> get_constant_blend_colors();
+
+	/**
+	 * Shuffle texel layout from xyzw to wzyx
+	 * TODO: Variable src/dst and optional se conversion
+	 */
+	template <typename T>
+	void shuffle_texel_data_wzyx(void *data, u16 row_pitch_in_bytes, u16 row_length_in_texels, u16 num_rows)
+	{
+		char *raw_src = (char*)data;
+		T tmp[4];
+
+		for (u16 n = 0; n < num_rows; ++n)
+		{
+			T* src = (T*)raw_src;
+			raw_src += row_pitch_in_bytes;
+
+			for (u16 m = 0; m < row_length_in_texels; ++m)
+			{
+				tmp[0] = src[3];
+				tmp[1] = src[2];
+				tmp[2] = src[1];
+				tmp[3] = src[0];
+
+				src[0] = tmp[0];
+				src[1] = tmp[1];
+				src[2] = tmp[2];
+				src[3] = tmp[3];
+
+				src += 4;
+			}
+		}
+	}
 
 	/**
 	 * Clips a rect so that it never falls outside the parent region
@@ -206,5 +247,69 @@ namespace rsx
 		}
 
 		return std::make_tuple(x, y, width, height);
+	}
+
+	static inline const f32 get_resolution_scale()
+	{
+		return g_cfg.video.strict_rendering_mode? 1.f : ((f32)g_cfg.video.resolution_scale_percent / 100.f);
+	}
+
+	static inline const int get_resolution_scale_percent()
+	{
+		return g_cfg.video.strict_rendering_mode ? 100 : g_cfg.video.resolution_scale_percent;
+	}
+
+	static inline const u16 apply_resolution_scale(u16 value, bool clamp)
+	{
+		if (value <= g_cfg.video.min_scalable_dimension)
+			return value;
+		else if (clamp)
+			return (u16)std::max((get_resolution_scale_percent() * value) / 100, 1);
+		else
+			return (get_resolution_scale_percent() * value) / 100;
+	}
+
+	static inline const u16 apply_inverse_resolution_scale(u16 value, bool clamp)
+	{
+		u16 result = value;
+
+		if (clamp)
+			result = (u16)std::max((value * 100) / get_resolution_scale_percent(), 1);
+		else
+			result = (value * 100) / get_resolution_scale_percent();
+
+		if (result <= g_cfg.video.min_scalable_dimension)
+			return value;
+
+		return result;
+	}
+
+	template <typename T>
+	void split_index_list(T* indices, int index_count, T restart_index, std::vector<std::pair<u32, u32>>& out)
+	{
+		int last_valid_index = -1;
+		int last_start = -1;
+
+		for (int i = 0; i < index_count; ++i)
+		{
+			if (indices[i] == UINT16_MAX)
+			{
+				if (last_start >= 0)
+				{
+					out.push_back(std::make_pair(last_start, i - last_start));
+					last_start = -1;
+				}
+
+				continue;
+			}
+
+			if (last_start < 0)
+				last_start = i;
+
+			last_valid_index = i;
+		}
+
+		if (last_start >= 0)
+			out.push_back(std::make_pair(last_start, last_valid_index - last_start + 1));
 	}
 }

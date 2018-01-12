@@ -63,6 +63,7 @@ public:
 	~msg_dialog_frame();
 	virtual void Create(const std::string& msg) override;
 	virtual void CreateOsk(const std::string& msg, char16_t* osk_text, u32 charlimit) override;
+	virtual void SetMsg(const std::string& msg) override;
 	virtual void ProgressBarSetMsg(u32 progressBarIndex, const std::string& msg) override;
 	virtual void ProgressBarReset(u32 progressBarIndex) override;
 	virtual void ProgressBarInc(u32 progressBarIndex, u32 delta) override;
@@ -81,8 +82,6 @@ public:
 	explicit custom_dialog(bool disableCancel, QWidget* parent = 0)
 		: QDialog(parent), m_disable_cancel(disableCancel)
 	{
-		setWindowIcon(QIcon(":/rpcs3.ico"));
-
 		if (m_disable_cancel)
 		{
 			setWindowFlags(windowFlags() & ~Qt::WindowCloseButtonHint);

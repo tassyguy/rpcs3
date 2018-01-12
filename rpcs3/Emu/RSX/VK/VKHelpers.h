@@ -8,10 +8,8 @@
 #include <memory>
 #include <unordered_map>
 
-#ifdef __linux__
-#include <X11/Xlib.h>
-#endif
-
+#include "Utilities/variant.hpp"
+#include "Emu/RSX/GSRender.h"
 #include "Emu/System.h"
 #include "VulkanAPI.h"
 #include "../GCM.h"
@@ -36,7 +34,7 @@ namespace rsx
 
 namespace vk
 {
-#define CHECK_RESULT(expr) { VkResult _res = (expr); if (_res != VK_SUCCESS) fmt::throw_exception("Assertion failed! Result is %Xh" HERE, (s32)_res); }
+#define CHECK_RESULT(expr) { VkResult _res = (expr); if (_res != VK_SUCCESS) vk::die_with_error(HERE, _res); }
 
 	VKAPI_ATTR void *VKAPI_CALL mem_realloc(void *pUserData, void *pOriginal, size_t size, size_t alignment, VkSystemAllocationScope allocationScope);
 	VKAPI_ATTR void *VKAPI_CALL mem_alloc(void *pUserData, size_t size, size_t alignment, VkSystemAllocationScope allocationScope);
@@ -66,6 +64,8 @@ namespace vk
 	vk::render_device *get_current_renderer();
 	void set_current_renderer(const vk::render_device &device);
 
+	bool emulate_primitive_restart();
+
 	VkComponentMapping default_component_map();
 	VkImageSubresource default_image_subresource();
 	VkImageSubresourceRange get_image_subresource_range(uint32_t base_layer, uint32_t base_mip, uint32_t layer_count, uint32_t level_count, VkImageAspectFlags aspect);
@@ -73,12 +73,16 @@ namespace vk
 	VkSampler null_sampler();
 	VkImageView null_image_view(vk::command_buffer&);
 
+	//Sync helpers around vkQueueSubmit
+	void acquire_global_submit_lock();
+	void release_global_submit_lock();
+
 	void destroy_global_resources();
 
 	void change_image_layout(VkCommandBuffer cmd, VkImage image, VkImageLayout current_layout, VkImageLayout new_layout, VkImageSubresourceRange range);
 	void change_image_layout(VkCommandBuffer cmd, vk::image *image, VkImageLayout new_layout, VkImageSubresourceRange range);
 	void copy_image(VkCommandBuffer cmd, VkImage &src, VkImage &dst, VkImageLayout srcLayout, VkImageLayout dstLayout, u32 width, u32 height, u32 mipmaps, VkImageAspectFlagBits aspect);
-	void copy_scaled_image(VkCommandBuffer cmd, VkImage &src, VkImage &dst, VkImageLayout srcLayout, VkImageLayout dstLayout, u32 src_x_offset, u32 src_y_offset, u32 src_width, u32 src_height, u32 dst_x_offset, u32 dst_y_offset, u32 dst_width, u32 dst_height, u32 mipmaps, VkImageAspectFlagBits aspect);
+	void copy_scaled_image(VkCommandBuffer cmd, VkImage &src, VkImage &dst, VkImageLayout srcLayout, VkImageLayout dstLayout, u32 src_x_offset, u32 src_y_offset, u32 src_width, u32 src_height, u32 dst_x_offset, u32 dst_y_offset, u32 dst_width, u32 dst_height, u32 mipmaps, VkImageAspectFlagBits aspect, bool compatible_formats);
 
 	VkFormat get_compatible_sampler_format(u32 format);
 	u8 get_format_texel_width(const VkFormat format);
@@ -93,6 +97,8 @@ namespace vk
 	void advance_frame_counter();
 	const u64 get_current_frame_id();
 	const u64 get_last_completed_frame_id();
+
+	void die_with_error(const char* faulting_addr, VkResult error_code);
 
 	struct memory_type_mapping
 	{
@@ -191,7 +197,7 @@ namespace vk
 			//Set up instance information
 			const char *requested_extensions[] =
 			{
-				"VK_KHR_swapchain"
+				VK_KHR_SWAPCHAIN_EXTENSION_NAME
 			};
 
 			std::vector<const char *> layers;
@@ -316,7 +322,7 @@ namespace vk
 			VkDevice dev = (VkDevice)(*owner);
 
 			u32 access_mask = 0;
-			
+
 			if (host_visible)
 				access_mask |= VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
 
@@ -404,7 +410,7 @@ namespace vk
 
 			VkMemoryRequirements memory_req;
 			vkGetImageMemoryRequirements(m_device, value, &memory_req);
-			
+
 			if (!(memory_req.memoryTypeBits & (1 << memory_type_index)))
 			{
 				//Suggested memory type is incompatible with this memory type.
@@ -572,7 +578,7 @@ namespace vk
 		VkSamplerCreateInfo info = {};
 
 		sampler(VkDevice dev, VkSamplerAddressMode clamp_u, VkSamplerAddressMode clamp_v, VkSamplerAddressMode clamp_w,
-			bool unnormalized_coordinates, float mipLodBias, float max_anisotropy, float min_lod, float max_lod,
+			VkBool32 unnormalized_coordinates, float mipLodBias, float max_anisotropy, float min_lod, float max_lod,
 			VkFilter min_filter, VkFilter mag_filter, VkSamplerMipmapMode mipmap_mode, VkBorderColor border_color,
 			VkBool32 depth_compare = false, VkCompareOp depth_compare_mode = VK_COMPARE_OP_NEVER)
 			: m_device(dev)
@@ -601,6 +607,21 @@ namespace vk
 		~sampler()
 		{
 			vkDestroySampler(m_device, value, nullptr);
+		}
+
+		bool matches(VkSamplerAddressMode clamp_u, VkSamplerAddressMode clamp_v, VkSamplerAddressMode clamp_w,
+			VkBool32 unnormalized_coordinates, float mipLodBias, float max_anisotropy, float min_lod, float max_lod,
+			VkFilter min_filter, VkFilter mag_filter, VkSamplerMipmapMode mipmap_mode, VkBorderColor border_color,
+			VkBool32 depth_compare = false, VkCompareOp depth_compare_mode = VK_COMPARE_OP_NEVER)
+		{
+			if (info.magFilter != mag_filter || info.minFilter != min_filter || info.mipmapMode != mipmap_mode ||
+				info.addressModeU != clamp_u || info.addressModeV != clamp_v || info.addressModeW != clamp_w ||
+				info.compareEnable != depth_compare || info.unnormalizedCoordinates != unnormalized_coordinates ||
+				info.mipLodBias != mipLodBias || info.maxAnisotropy != max_anisotropy || info.maxLod != max_lod ||
+				info.minLod != min_lod || info.compareOp != depth_compare_mode || info.borderColor != border_color)
+				return false;
+
+			return true;
 		}
 
 		sampler(const sampler&) = delete;
@@ -805,7 +826,7 @@ namespace vk
 			}
 		}
 
-		void init_swapchain(u32 width, u32 height)
+		bool init_swapchain(u32 width, u32 height)
 		{
 			VkSwapchainKHR old_swapchain = m_vk_swapchain;
 			vk::physical_device& gpu = const_cast<vk::physical_device&>(dev.gpu());
@@ -813,8 +834,16 @@ namespace vk
 			VkSurfaceCapabilitiesKHR surface_descriptors = {};
 			CHECK_RESULT(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(gpu, m_surface, &surface_descriptors));
 
-			VkExtent2D swapchainExtent;
+			if (surface_descriptors.maxImageExtent.width < width ||
+				surface_descriptors.maxImageExtent.height < height)
+			{
+				LOG_ERROR(RSX, "Swapchain: Swapchain creation failed because dimensions cannot fit. Max = %d, %d, Requested = %d, %d",
+					surface_descriptors.maxImageExtent.width, surface_descriptors.maxImageExtent.height, width, height);
 
+				return false;
+			}
+
+			VkExtent2D swapchainExtent;
 			if (surface_descriptors.currentExtent.width == (uint32_t)-1)
 			{
 				swapchainExtent.width = width;
@@ -822,6 +851,12 @@ namespace vk
 			}
 			else
 			{
+				if (surface_descriptors.currentExtent.width == 0 || surface_descriptors.currentExtent.height == 0)
+				{
+					LOG_WARNING(RSX, "Swapchain: Current surface extent is a null region. Is the window minimized?");
+					return false;
+				}
+
 				swapchainExtent = surface_descriptors.currentExtent;
 				width = surface_descriptors.currentExtent.width;
 				height = surface_descriptors.currentExtent.height;
@@ -834,21 +869,33 @@ namespace vk
 			CHECK_RESULT(vkGetPhysicalDeviceSurfacePresentModesKHR(gpu, m_surface, &nb_available_modes, present_modes.data()));
 
 			VkPresentModeKHR swapchain_present_mode = VK_PRESENT_MODE_FIFO_KHR;
+			std::vector<VkPresentModeKHR> preferred_modes;
 
-			for (VkPresentModeKHR mode : present_modes)
+			//List of preferred modes in decreasing desirability
+			if (g_cfg.video.vsync)
+				preferred_modes = { VK_PRESENT_MODE_MAILBOX_KHR };
+			else
+				preferred_modes = { VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_FIFO_RELAXED_KHR, VK_PRESENT_MODE_MAILBOX_KHR };
+
+			bool mode_found = false;
+			for (VkPresentModeKHR preferred_mode : preferred_modes)
 			{
-				if (mode == VK_PRESENT_MODE_MAILBOX_KHR)
+				//Search for this mode in supported modes
+				for (VkPresentModeKHR mode : present_modes)
 				{
-					//If we can get a mailbox mode, use it
-					swapchain_present_mode = mode;
-					break;
+					if (mode == preferred_mode)
+					{
+						swapchain_present_mode = mode;
+						mode_found = true;
+						break;
+					}
 				}
 
-				//If we can get out of using the FIFO mode, take it. Fifo is very high latency (generic vsync)
-				if (swapchain_present_mode == VK_PRESENT_MODE_FIFO_KHR &&
-					(mode == VK_PRESENT_MODE_IMMEDIATE_KHR || mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR))
-					swapchain_present_mode = mode;
+				if (mode_found)
+					break;
 			}
+
+			LOG_NOTICE(RSX, "Swapchain: present mode %d in use.", (s32&)swapchain_present_mode);
 
 			uint32_t nb_swap_images = surface_descriptors.minImageCount + 1;
 			if (surface_descriptors.maxImageCount > 0)
@@ -904,7 +951,7 @@ namespace vk
 
 			nb_swap_images = 0;
 			getSwapchainImagesKHR(dev, m_vk_swapchain, &nb_swap_images, nullptr);
-			
+
 			if (!nb_swap_images) fmt::throw_exception("Driver returned 0 images for swapchain" HERE);
 
 			std::vector<VkImage> swap_images;
@@ -916,6 +963,8 @@ namespace vk
 			{
 				m_swap_images[i].create(dev, swap_images[i], m_surface_format);
 			}
+
+			return true;
 		}
 
 		u32 get_swap_image_count()
@@ -998,6 +1047,14 @@ namespace vk
 		VkCommandBuffer commands = nullptr;
 
 	public:
+		enum access_type_hint
+		{
+			flush_only, //Only to be submitted/opened/closed via command flush
+			all         //Auxilliary, can be sumitted/opened/closed at any time
+		}
+		access_hint = flush_only;
+
+	public:
 		command_buffer() {}
 		~command_buffer() {}
 
@@ -1072,7 +1129,9 @@ namespace vk
 			infos.waitSemaphoreCount = static_cast<uint32_t>(semaphores.size());
 			infos.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
 
+			acquire_global_submit_lock();
 			CHECK_RESULT(vkQueueSubmit(queue, 1, &infos, fence));
+			release_global_submit_lock();
 		}
 	};
 
@@ -1124,11 +1183,11 @@ namespace vk
 			m_instance = nullptr;
 			m_vk_instances.resize(0);
 		}
-		
+
 		void enable_debugging()
 		{
 			if (!g_cfg.video.debug_output) return;
-			 
+
 			PFN_vkDebugReportCallbackEXT callback = vk::dbgFunc;
 
 			createDebugReportCallback = (PFN_vkCreateDebugReportCallbackEXT)vkGetInstanceProcAddr(m_instance, "vkCreateDebugReportCallbackEXT");
@@ -1159,13 +1218,16 @@ namespace vk
 			//Set up instance information
 			const char *requested_extensions[] =
 			{
-				"VK_KHR_surface",
+				VK_KHR_SURFACE_EXTENSION_NAME,
 #ifdef _WIN32
-				"VK_KHR_win32_surface",
+				VK_KHR_WIN32_SURFACE_EXTENSION_NAME,
 #else
-				"VK_KHR_xlib_surface",
+				VK_KHR_XLIB_SURFACE_EXTENSION_NAME,
 #endif
-				"VK_EXT_debug_report",
+#ifdef VK_USE_PLATFORM_WAYLAND_KHR
+				VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME,
+#endif
+				VK_EXT_DEBUG_REPORT_EXTENSION_NAME,
 			};
 
 			std::vector<const char *> layers;
@@ -1178,7 +1240,7 @@ namespace vk
 			instance_info.pApplicationInfo = &app;
 			instance_info.enabledLayerCount = static_cast<uint32_t>(layers.size());
 			instance_info.ppEnabledLayerNames = layers.data();
-			instance_info.enabledExtensionCount = fast? 0: 3;
+			instance_info.enabledExtensionCount = fast? 0: sizeof(requested_extensions)/sizeof(char*);
 			instance_info.ppEnabledExtensionNames = fast? nullptr: requested_extensions;
 
 			VkInstance instance;
@@ -1243,8 +1305,8 @@ namespace vk
 		}
 
 #ifdef _WIN32
-		
-		vk::swap_chain* createSwapChain(HINSTANCE hInstance, HWND hWnd, vk::physical_device &dev)
+
+		vk::swap_chain* createSwapChain(HINSTANCE hInstance, display_handle_t hWnd, vk::physical_device &dev)
 		{
 			VkWin32SurfaceCreateInfoKHR createInfo = {};
 			createInfo.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
@@ -1254,16 +1316,31 @@ namespace vk
 			VkSurfaceKHR surface;
 			CHECK_RESULT(vkCreateWin32SurfaceKHR(m_instance, &createInfo, NULL, &surface));
 #elif HAVE_VULKAN
-		
-		vk::swap_chain* createSwapChain(Display *display, Window window, vk::physical_device &dev)
+
+		vk::swap_chain* createSwapChain(display_handle_t ctx, vk::physical_device &dev)
 		{
-			VkXlibSurfaceCreateInfoKHR createInfo = {};
-			createInfo.sType = VK_STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR;
-			createInfo.dpy = display;
-			createInfo.window = window;
-			
 			VkSurfaceKHR surface;
-			CHECK_RESULT(vkCreateXlibSurfaceKHR(m_instance, &createInfo, nullptr, &surface));
+
+			ctx.match(
+				[&](std::pair<Display*, Window> p)
+				{
+					VkXlibSurfaceCreateInfoKHR createInfo = {};
+					createInfo.sType = VK_STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR;
+					createInfo.dpy = p.first;
+					createInfo.window = p.second;
+					CHECK_RESULT(vkCreateXlibSurfaceKHR(this->m_instance, &createInfo, nullptr, &surface));
+				}
+#ifdef VK_USE_PLATFORM_WAYLAND_KHR
+				, [&](std::pair<wl_display*, wl_surface*> p)
+				{
+					VkWaylandSurfaceCreateInfoKHR createInfo = {};
+					createInfo.sType = VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR;
+					createInfo.display = p.first;
+					createInfo.surface = p.second;
+					CHECK_RESULT(vkCreateWaylandSurfaceKHR(this->m_instance, &createInfo, nullptr, &surface));
+				}
+#endif
+			);
 #endif
 
 			uint32_t device_queues = dev.get_queue_count();
@@ -1378,7 +1455,7 @@ namespace vk
 		void destroy()
 		{
 			if (!pool) return;
-			
+
 			vkDestroyDescriptorPool((*owner), pool, nullptr);
 			owner = nullptr;
 			pool = nullptr;
@@ -1392,6 +1469,113 @@ namespace vk
 		operator VkDescriptorPool()
 		{
 			return pool;
+		}
+	};
+
+	class occlusion_query_pool
+	{
+		VkQueryPool query_pool = VK_NULL_HANDLE;
+		vk::render_device* owner = nullptr;
+
+		std::vector<bool> query_active_status;
+
+	public:
+
+		void create(vk::render_device &dev, u32 num_entries)
+		{
+			VkQueryPoolCreateInfo info = {};
+			info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+			info.queryType = VK_QUERY_TYPE_OCCLUSION;
+			info.queryCount = num_entries;
+
+			CHECK_RESULT(vkCreateQueryPool(dev, &info, nullptr, &query_pool));
+			owner = &dev;
+
+			query_active_status.resize(num_entries, false);
+		}
+
+		void destroy()
+		{
+			if (query_pool)
+			{
+				vkDestroyQueryPool(*owner, query_pool, nullptr);
+
+				owner = nullptr;
+				query_pool = VK_NULL_HANDLE;
+			}
+		}
+
+		void begin_query(vk::command_buffer &cmd, u32 index)
+		{
+			if (query_active_status[index])
+			{
+				//Synchronization must be done externally
+				vkCmdResetQueryPool(cmd, query_pool, index, 1);
+			}
+
+			vkCmdBeginQuery(cmd, query_pool, index, 0);//VK_QUERY_CONTROL_PRECISE_BIT);
+			query_active_status[index] = true;
+		}
+
+		void end_query(vk::command_buffer &cmd, u32 index)
+		{
+			vkCmdEndQuery(cmd, query_pool, index);
+		}
+
+		bool check_query_status(u32 index)
+		{
+			u32 result[2] = {0, 0};
+			switch (VkResult status = vkGetQueryPoolResults(*owner, query_pool, index, 1, 8, result, 8, VK_QUERY_RESULT_WITH_AVAILABILITY_BIT))
+			{
+			case VK_SUCCESS:
+				break;
+			case VK_NOT_READY:
+				return false;
+			default:
+				vk::die_with_error(HERE, status);
+			}
+
+			return result[1] != 0;
+		}
+
+		u32 get_query_result(u32 index)
+		{
+			u32 result = 0;
+			CHECK_RESULT(vkGetQueryPoolResults(*owner, query_pool, index, 1, 4, &result, 4, VK_QUERY_RESULT_WAIT_BIT));
+
+			return result == 0u? 0u: 1u;
+		}
+
+		void reset_query(vk::command_buffer &cmd, u32 index)
+		{
+			vkCmdResetQueryPool(cmd, query_pool, index, 1);
+			query_active_status[index] = false;
+		}
+
+		void reset_queries(vk::command_buffer &cmd, std::vector<u32> &list)
+		{
+			for (const auto index : list)
+				reset_query(cmd, index);
+		}
+
+		void reset_all(vk::command_buffer &cmd)
+		{
+			for (u32 n = 0; n < query_active_status.size(); n++)
+			{
+				if (query_active_status[n])
+					reset_query(cmd, n);
+			}
+		}
+
+		u32 find_free_slot()
+		{
+			for (u32 n = 0; n < query_active_status.size(); n++)
+			{
+				if (query_active_status[n] == false)
+					return n;
+			}
+
+			return UINT32_MAX;
 		}
 	};
 
@@ -1423,7 +1607,7 @@ namespace vk
 		{
 			::glsl::program_domain domain;
 			program_input_type type;
-			
+
 			bound_buffer as_buffer;
 			bound_sampler as_sampler;
 

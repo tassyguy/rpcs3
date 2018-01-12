@@ -6,6 +6,7 @@
 #include "../Common/surface_store.h"
 #include "../Common/TextureUtils.h"
 #include "VKFormats.h"
+#include "../rsx_utils.h"
 
 struct ref_counted
 {
@@ -21,10 +22,15 @@ namespace vk
 		bool dirty = false;
 		u16 native_pitch = 0;
 		u16 rsx_pitch = 0;
+
+		u16 surface_width = 0;
+		u16 surface_height = 0;
+
 		VkImageAspectFlags attachment_aspect_flag = VK_IMAGE_ASPECT_COLOR_BIT;
 		std::unique_ptr<vk::image_view> view;
 
 		render_target *old_contents = nullptr; //Data occupying the memory location that this surface is replacing
+		u64 frame_tag = 0; //frame id when invalidated, 0 if not invalid
 
 		render_target(vk::render_device &dev,
 			uint32_t memory_type_index,
@@ -59,12 +65,12 @@ namespace vk
 
 		u16 get_surface_width() const override
 		{
-			return width();
+			return surface_width;
 		}
 
 		u16 get_surface_height() const override
 		{
-			return height();
+			return surface_height;
 		}
 
 		u16 get_rsx_pitch() const override
@@ -75,6 +81,12 @@ namespace vk
 		u16 get_native_pitch() const override
 		{
 			return native_pitch;
+		}
+
+		bool matches_dimensions(u16 _width, u16 _height) const
+		{
+			//Use foward scaling to account for rounding and clamping errors
+			return (rsx::apply_resolution_scale(_width, true) == width()) && (rsx::apply_resolution_scale(_height, true) == height());
 		}
 	};
 
@@ -114,7 +126,7 @@ namespace rsx
 				VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
 				VK_IMAGE_TYPE_2D,
 				requested_format,
-				static_cast<uint32_t>(width), static_cast<uint32_t>(height), 1, 1, 1,
+				static_cast<uint32_t>(rsx::apply_resolution_scale((u16)width, true)), static_cast<uint32_t>(rsx::apply_resolution_scale((u16)height, true)), 1, 1, 1,
 				VK_SAMPLE_COUNT_1_BIT,
 				VK_IMAGE_LAYOUT_UNDEFINED,
 				VK_IMAGE_TILING_OPTIMAL,
@@ -135,6 +147,8 @@ namespace rsx
 
 			rtt->native_component_map = fmt.second;
 			rtt->native_pitch = (u16)width * get_format_block_size_in_bytes(format);
+			rtt->surface_width = (u16)width;
+			rtt->surface_height = (u16)height;
 
 			if (old_surface != nullptr && old_surface->info.format == requested_format)
 			{
@@ -158,12 +172,14 @@ namespace rsx
 			if (requested_format != VK_FORMAT_D16_UNORM)
 				range.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
 
+			const auto scale = rsx::get_resolution_scale();
+
 			std::unique_ptr<vk::render_target> ds;
 			ds.reset(new vk::render_target(device, mem_mapping.device_local,
 				VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
 				VK_IMAGE_TYPE_2D,
 				requested_format,
-				static_cast<uint32_t>(width), static_cast<uint32_t>(height), 1, 1, 1,
+				static_cast<uint32_t>(rsx::apply_resolution_scale((u16)width, true)), static_cast<uint32_t>(rsx::apply_resolution_scale((u16)height, true)), 1, 1, 1,
 				VK_SAMPLE_COUNT_1_BIT,
 				VK_IMAGE_LAYOUT_UNDEFINED,
 				VK_IMAGE_TILING_OPTIMAL,
@@ -187,6 +203,8 @@ namespace rsx
 				ds->native_pitch *= 2;
 
 			ds->attachment_aspect_flag = range.aspectMask;
+			ds->surface_width = (u16)width;
+			ds->surface_height = (u16)height;
 
 			if (old_surface != nullptr && old_surface->info.format == requested_format)
 			{
@@ -202,8 +220,8 @@ namespace rsx
 		{
 			info->rsx_pitch = surface->rsx_pitch;
 			info->native_pitch = surface->native_pitch;
-			info->surface_width = surface->info.extent.width;
-			info->surface_height = surface->info.extent.height;
+			info->surface_width = surface->get_surface_width();
+			info->surface_height = surface->get_surface_height();
 			info->bpp = static_cast<u8>(info->native_pitch / info->surface_width);
 		}
 
@@ -214,6 +232,7 @@ namespace rsx
 
 			//Reset deref count
 			surface->deref_count = 0;
+			surface->frame_tag = 0;
 		}
 
 		static void prepare_rtt_for_sampling(vk::command_buffer* pcmd, vk::render_target *surface)
@@ -229,6 +248,7 @@ namespace rsx
 
 			//Reset deref count
 			surface->deref_count = 0;
+			surface->frame_tag = 0;
 		}
 
 		static void prepare_ds_for_sampling(vk::command_buffer* pcmd, vk::render_target *surface)
@@ -252,6 +272,13 @@ namespace rsx
 			ds->old_contents = old_surface;
 		}
 
+		static
+		void notify_surface_invalidated(const std::unique_ptr<vk::render_target> &surface)
+		{
+			surface->frame_tag = vk::get_current_frame_id();
+			if (!surface->frame_tag) surface->frame_tag = 1;
+		}
+
 		static bool rtt_has_format_width_height(const std::unique_ptr<vk::render_target> &rtt, surface_color_format format, size_t width, size_t height, bool check_refs=false)
 		{
 			if (check_refs && rtt->deref_count == 0) //Surface may still have read refs from data 'copy'
@@ -260,8 +287,7 @@ namespace rsx
 			VkFormat fmt = vk::get_compatible_surface_format(format).first;
 
 			if (rtt->info.format == fmt &&
-				rtt->info.extent.width == width &&
-				rtt->info.extent.height == height)
+				rtt->matches_dimensions((u16)width, (u16)height))
 				return true;
 
 			return false;
@@ -272,8 +298,7 @@ namespace rsx
 			if (check_refs && ds->deref_count == 0) //Surface may still have read refs from data 'copy'
 				return false;
 
-			if (ds->info.extent.width == width &&
-				ds->info.extent.height == height)
+			if (ds->matches_dimensions((u16)width, (u16)height))
 			{
 				//Check format
 				switch (ds->info.format)
@@ -330,9 +355,13 @@ namespace rsx
 
 		void free_invalidated()
 		{
-			invalidated_resources.remove_if([](std::unique_ptr<vk::render_target> &rtt)
+			const u64 last_finished_frame = vk::get_last_completed_frame_id();
+			invalidated_resources.remove_if([&](std::unique_ptr<vk::render_target> &rtt)
 			{
-				if (rtt->deref_count >= 2) return true;
+				verify(HERE), rtt->frame_tag != 0;
+
+				if (rtt->deref_count >= 2 && rtt->frame_tag < last_finished_frame)
+					return true;
 
 				rtt->deref_count++;
 				return false;

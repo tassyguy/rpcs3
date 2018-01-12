@@ -1,6 +1,7 @@
 #pragma once
 #include "Utilities/types.h"
 #include "Utilities/BitField.h"
+#include "Utilities/StrFmt.h"
 #include <tuple>
 #include "gcm_enums.h"
 #pragma warning(disable:4503)
@@ -27,7 +28,7 @@ namespace
 		case rsx::vertex_base_type::cmp: return "CMP";
 		case rsx::vertex_base_type::ub256: return "Unsigned byte unormalized";
 		}
-		throw;
+		fmt::throw_exception("Unexpected enum found" HERE);
 	}
 }
 
@@ -697,6 +698,32 @@ struct registers_decoder<NV4097_SET_DEPTH_MASK>
 	static std::string dump(decoded_type &&decoded_values)
 	{
 		return "Depth: write " + print_boolean(decoded_values.depth_write_enabled());
+	}
+};
+
+template<>
+struct registers_decoder<NV4097_SET_ZMIN_MAX_CONTROL>
+{
+	struct decoded_type
+	{
+	private:
+		union
+		{
+			u32 raw_value;
+			bitfield_decoder_t<4, 4> depth_clamp_enabled;
+		} m_data;
+	public:
+		decoded_type(u32 raw_value) { m_data.raw_value = raw_value; }
+
+		bool depth_clamp_enabled() const
+		{
+			return bool(m_data.depth_clamp_enabled);
+		}
+	};
+
+	static std::string dump(decoded_type &&decoded_values)
+	{
+		return "Depth: clamp " + print_boolean(decoded_values.depth_clamp_enabled());
 	}
 };
 
@@ -3195,6 +3222,11 @@ struct registers_decoder<NV4097_SET_COLOR_MASK>
 		{
 			return bool(m_data.color_a);
 		}
+
+		bool color_write_enabled() const
+		{
+			return m_data.raw_data != 0;
+		}
 	};
 
 	static std::string dump(decoded_type &&decoded_values)
@@ -3370,6 +3402,31 @@ struct registers_decoder<NV4097_SET_LINE_WIDTH>
 	static std::string dump(decoded_type &&decoded_values)
 	{
 		return "Line width: " + std::to_string(decoded_values.line_width());
+	}
+};
+
+template<>
+struct registers_decoder<NV4097_SET_POINT_SIZE>
+{
+	struct decoded_type
+	{
+	private:
+		union
+		{
+			u32 raw_data;
+		} m_data;
+	public:
+		decoded_type(u32 raw_value) { m_data.raw_data = raw_value; }
+
+		f32 point_size() const
+		{
+			return (f32&)m_data.raw_data;
+		}
+	};
+
+	static std::string dump(decoded_type &&decoded_values)
+	{
+		return "Point size: " + std::to_string(decoded_values.point_size());
 	}
 };
 

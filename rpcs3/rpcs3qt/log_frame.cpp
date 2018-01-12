@@ -102,26 +102,24 @@ static gui_listener s_gui_listener;
 
 log_frame::log_frame(std::shared_ptr<gui_settings> guiSettings, QWidget *parent) : QDockWidget(tr("Log"), parent), xgui_settings(guiSettings)
 {
-	QTabWidget* tabWidget = new QTabWidget;
+	m_tabWidget = new QTabWidget;
 
-	m_log = new QTextEdit(tabWidget);
-	QPalette logPalette = m_log->palette();
-	logPalette.setColor(QPalette::Base, Qt::black);
-	m_log->setPalette(logPalette);
+	m_log = new QTextEdit(m_tabWidget);
+	m_log->setObjectName("log_frame");
 	m_log->setReadOnly(true);
 	m_log->setContextMenuPolicy(Qt::CustomContextMenu);
+	m_log->installEventFilter(this);
 
-	m_tty = new QTextEdit(tabWidget);
-	QPalette ttyPalette = m_log->palette();
-	ttyPalette.setColor(QPalette::Base, Qt::black);
-	ttyPalette.setColor(QPalette::Text, Qt::white);
-	m_tty->setPalette(ttyPalette);
+	m_tty = new QTextEdit(m_tabWidget);
+	m_tty->setObjectName("tty_frame");
 	m_tty->setReadOnly(true);
+	m_tty->setContextMenuPolicy(Qt::CustomContextMenu);
+	m_tty->installEventFilter(this);
 
-	tabWidget->addTab(m_log, tr("Log"));
-	tabWidget->addTab(m_tty, tr("TTY"));
+	m_tabWidget->addTab(m_log, tr("Log"));
+	m_tabWidget->addTab(m_tty, tr("TTY"));
 
-	setWidget(tabWidget);
+	setWidget(m_tabWidget);
 
 	// Open or create TTY.log
 	m_tty_file.open(fs::get_config_dir() + "TTY.log", fs::read + fs::create);
@@ -197,12 +195,15 @@ void log_frame::CreateAndConnectActions()
 		connect(act, &QAction::triggered, [this, logLevel]()
 		{
 			s_gui_listener.enabled = std::max(logLevel, logs::level::fatal);
-			xgui_settings->SetValue(GUI::l_level, static_cast<uint>(logLevel));
+			xgui_settings->SetValue(gui::l_level, static_cast<uint>(logLevel));
 		});
 	};
 
 	m_clearAct = new QAction(tr("Clear"), this);
 	connect(m_clearAct, &QAction::triggered, m_log, &QTextEdit::clear);
+
+	m_clearTTYAct = new QAction(tr("Clear"), this);
+	connect(m_clearTTYAct, &QAction::triggered, m_tty, &QTextEdit::clear);
 
 	// Action groups make these actions mutually exclusive.
 	m_logLevels = new QActionGroup(this);
@@ -220,7 +221,7 @@ void log_frame::CreateAndConnectActions()
 	m_stackAct->setCheckable(true);
 	connect(m_stackAct, &QAction::toggled, xgui_settings.get(), [=](bool checked)
 	{
-		xgui_settings->SetValue(GUI::l_stack, checked);
+		xgui_settings->SetValue(gui::l_stack, checked);
 		m_stack_log = checked;
 	});
 
@@ -228,7 +229,7 @@ void log_frame::CreateAndConnectActions()
 	m_TTYAct->setCheckable(true);
 	connect(m_TTYAct, &QAction::triggered, xgui_settings.get(), [=](bool checked)
 	{
-		xgui_settings->SetValue(GUI::l_tty, checked);
+		xgui_settings->SetValue(gui::l_tty, checked);
 	});
 
 	l_initAct(m_nothingAct, logs::level::fatal);
@@ -253,15 +254,47 @@ void log_frame::CreateAndConnectActions()
 		menu->exec(mapToGlobal(pos));
 	});
 
+	connect(m_tty, &QWidget::customContextMenuRequested, [=](const QPoint& pos)
+	{
+		QMenu* menu = m_tty->createStandardContextMenu();
+		menu->addAction(m_clearTTYAct);
+		menu->exec(mapToGlobal(pos));
+	});
+
+	connect(m_tabWidget, &QTabWidget::currentChanged, [this](int index)
+	{
+		if (m_find_dialog)
+			m_find_dialog->close();
+	});
+
 	LoadSettings();
 }
 
 void log_frame::LoadSettings()
 {
 	SetLogLevel(xgui_settings->GetLogLevel());
-	SetTTYLogging(xgui_settings->GetValue(GUI::l_tty).toBool());
-	m_stack_log = xgui_settings->GetValue(GUI::l_stack).toBool();
+	SetTTYLogging(xgui_settings->GetValue(gui::l_tty).toBool());
+	m_stack_log = xgui_settings->GetValue(gui::l_stack).toBool();
 	m_stackAct->setChecked(m_stack_log);
+}
+
+//TODO: repaint old text with new colors
+void log_frame::RepaintTextColors()
+{
+	// Get text color. Do this once to prevent possible slowdown
+	m_color.clear();
+	m_color.append(gui::get_Label_Color("log_level_always"));
+	m_color.append(gui::get_Label_Color("log_level_fatal"));
+	m_color.append(gui::get_Label_Color("log_level_error"));
+	m_color.append(gui::get_Label_Color("log_level_todo"));
+	m_color.append(gui::get_Label_Color("log_level_success"));
+	m_color.append(gui::get_Label_Color("log_level_warning"));
+	m_color.append(gui::get_Label_Color("log_level_notice"));
+	m_color.append(gui::get_Label_Color("log_level_trace"));
+
+	m_color_stack = gui::get_Label_Color("log_stack");
+
+	m_tty->setTextColor(gui::get_Label_Color("tty_text"));
 }
 
 void log_frame::UpdateUI()
@@ -315,19 +348,17 @@ void log_frame::UpdateUI()
 		// Confirm log level
 		if (packet->sev <= s_gui_listener.enabled)
 		{
-			// Get text color
-			QColor color;
 			QString text;
 			switch (packet->sev)
 			{
-			case logs::level::always: color = QColor(0x00, 0xFF, 0xFF); break; // Cyan
-			case logs::level::fatal: text = "F "; color = QColor(0xFF, 0x00, 0xFF); break; // Fuchsia
-			case logs::level::error: text = "E "; color = QColor(0xFF, 0x00, 0x00); break; // Red
-			case logs::level::todo: text = "U "; color = QColor(0xFF, 0x60, 0x00); break; // Orange
-			case logs::level::success: text = "S ";  color = QColor(0x00, 0xFF, 0x00); break; // Green
-			case logs::level::warning: text = "W "; color = QColor(0xFF, 0xFF, 0x00); break; // Yellow
-			case logs::level::notice: text = "! ";  color = QColor(0xFF, 0xFF, 0xFF); break; // White
-			case logs::level::trace: text = "T ";  color = QColor(0x80, 0x80, 0x80); break; // Gray
+			case logs::level::always: break;
+			case logs::level::fatal: text = "F "; break;
+			case logs::level::error: text = "E "; break;
+			case logs::level::todo: text = "U "; break;
+			case logs::level::success: text = "S "; break;
+			case logs::level::warning: text = "W "; break;
+			case logs::level::notice: text = "! "; break;
+			case logs::level::trace: text = "T "; break;
 			default: continue;
 			}
 
@@ -361,7 +392,7 @@ void log_frame::UpdateUI()
 					m_log_counter++;
 					suffix = QString(" x%1").arg(m_log_counter);
 					m_log->moveCursor(QTextCursor::End, QTextCursor::MoveAnchor);
-					m_log->moveCursor(QTextCursor::StartOfLine, QTextCursor::MoveAnchor);
+					m_log->moveCursor(QTextCursor::StartOfBlock, QTextCursor::MoveAnchor);
 					m_log->moveCursor(QTextCursor::End, QTextCursor::KeepAnchor);
 					m_log->textCursor().removeSelectedText();
 					m_log->textCursor().deletePreviousChar();
@@ -374,13 +405,13 @@ void log_frame::UpdateUI()
 			}
 
 			// add actual log message
-			m_log->setTextColor(color);
+			m_log->setTextColor(m_color[static_cast<int>(packet->sev)]);
 			m_log->append(text);
 
 			// add counter suffix if needed
 			if (m_stack_log && isSame)
 			{
-				m_log->setTextColor(Qt::white);
+				m_log->setTextColor(m_color_stack);
 				m_log->insertPlainText(suffix);
 			}
 
@@ -411,4 +442,26 @@ void log_frame::closeEvent(QCloseEvent *event)
 {
 	QDockWidget::closeEvent(event);
 	Q_EMIT LogFrameClosed();
+}
+
+bool log_frame::eventFilter(QObject* object, QEvent* event)
+{
+	if (object != m_log && object != m_tty)
+	{
+		return QDockWidget::eventFilter(object, event);
+	}
+
+	if (event->type() == QEvent::KeyPress)
+	{
+		QKeyEvent* e = (QKeyEvent*)event;
+		if (e->modifiers() == Qt::ControlModifier && e->key() == Qt::Key_F)
+		{
+			if (m_find_dialog && m_find_dialog->isVisible())
+				m_find_dialog->close();
+
+			m_find_dialog = std::make_unique<find_dialog>((QTextEdit*)object, this);
+		}
+	}
+
+	return QDockWidget::eventFilter(object, event);
 }

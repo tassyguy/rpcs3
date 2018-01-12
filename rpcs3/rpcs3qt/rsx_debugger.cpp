@@ -18,6 +18,7 @@ rsx_debugger::rsx_debugger(QWidget* parent)
 {
 	setWindowTitle(tr("RSX Debugger"));
 	setAttribute(Qt::WA_DeleteOnClose);
+	setWindowFlags(windowFlags() & ~Qt::WindowContextHelpButtonHint);
 
 	//Fonts and Colors
 	QFont mono = QFontDatabase::systemFont(QFontDatabase::FixedFont);
@@ -387,11 +388,10 @@ namespace
 		if (img.isNull()) return;
 		//QString title = qstr(fmt::format("Raw Image @ 0x%x", addr));
 		QLabel* canvas = new QLabel();
-		QPalette pal_bg;
-		pal_bg.setColor(canvas->backgroundRole(), QColor(240, 240, 240));
-		canvas->setPalette(pal_bg); //This fix the ugly background color under Windows
+		canvas->setObjectName("rsx_debugger_display_buffer");
 		canvas->setPixmap(QPixmap::fromImage(img));
 		canvas->setFixedSize(img.size());
+		canvas->ensurePolished();
 		canvas->show();
 	}
 }

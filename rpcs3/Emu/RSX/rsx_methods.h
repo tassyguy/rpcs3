@@ -39,6 +39,11 @@ namespace rsx
 		std::vector<std::pair<u32, u32> > first_count_commands;
 
 		/**
+		 * Optionally split first-count pairs for disjoint range rendering. Valid when emulating primitive restart
+		 */
+		std::vector<std::pair<u32, u32> > alternate_first_count_commands;
+
+		/**
 		 * Returns how many vertex or index will be consumed by the draw clause.
 		 */
 		u32 get_elements_count() const
@@ -338,6 +343,11 @@ namespace rsx
 		bool color_mask_a() const
 		{
 			return decode<NV4097_SET_COLOR_MASK>().color_a();
+		}
+
+		bool color_write_enabled() const
+		{
+			return decode<NV4097_SET_COLOR_MASK>().color_write_enabled();
 		}
 
 		u8 clear_color_b() const
@@ -665,6 +675,11 @@ namespace rsx
 		f32 line_width() const
 		{
 			return decode<NV4097_SET_LINE_WIDTH>().line_width();
+		}
+
+		f32 point_size() const
+		{
+			return decode<NV4097_SET_POINT_SIZE>().point_size();
 		}
 
 		u8 alpha_ref() const
@@ -1165,6 +1180,31 @@ namespace rsx
 		u32 transform_branch_bits()
 		{
 			return registers[NV4097_SET_TRANSFORM_BRANCH_BITS];
+		}
+
+		u16 msaa_sample_mask()
+		{
+			return decode<NV4097_SET_ANTI_ALIASING_CONTROL>().msaa_sample_mask();
+		}
+
+		bool msaa_enabled()
+		{
+			return decode<NV4097_SET_ANTI_ALIASING_CONTROL>().msaa_enabled();
+		}
+
+		bool msaa_alpha_to_coverage_enabled()
+		{
+			return decode<NV4097_SET_ANTI_ALIASING_CONTROL>().msaa_alpha_to_coverage();
+		}
+
+		bool msaa_alpha_to_one_enabled()
+		{
+			return decode<NV4097_SET_ANTI_ALIASING_CONTROL>().msaa_alpha_to_one();
+		}
+
+		bool depth_clamp_enabled()
+		{
+			return decode<NV4097_SET_ZMIN_MAX_CONTROL>().depth_clamp_enabled();
 		}
 	};
 

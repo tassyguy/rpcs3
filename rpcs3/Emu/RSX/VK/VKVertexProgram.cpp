@@ -15,10 +15,9 @@ std::string VKVertexDecompilerThread::getIntTypeName(size_t elementCount)
 	return "ivec4";
 }
 
-
 std::string VKVertexDecompilerThread::getFunction(FUNCTION f)
 {
-	return vk::getFunctionImpl(f);
+	return glsl::getFunctionImpl(f);
 }
 
 std::string VKVertexDecompilerThread::compareFunction(COMPARE f, const std::string &Op0, const std::string &Op1)
@@ -37,6 +36,7 @@ void VKVertexDecompilerThread::insertHeader(std::stringstream &OS)
 	OS << "	vec4 user_clip_factor[2];\n";
 	OS << "	uint transform_branch_bits;\n";
 	OS << "	uint vertex_base_index;\n";
+	OS << "	float point_size;\n";
 	OS << "	ivec4 input_attributes[16];\n";
 	OS << "};\n";
 
@@ -310,6 +310,7 @@ void VKVertexDecompilerThread::insertMainEnd(std::stringstream & OS)
 		if (m_parr.HasParam(PF_PARAM_NONE, "vec4", "dst_reg2"))
 			OS << "	front_spec_color = dst_reg2;\n";
 
+	OS << "	gl_PointSize = point_size;\n";
 	OS << "	gl_Position = gl_Position * scale_offset_mat;\n";
 	OS << "}\n";
 }
@@ -339,7 +340,7 @@ void VKVertexProgram::Decompile(const RSXVertexProgram& prog)
 void VKVertexProgram::Compile()
 {
 	fs::create_path(fs::get_config_dir() + "/shaderlog");
-	fs::file(fs::get_config_dir() + "shaderlog/VertexProgram.spirv", fs::rewrite).write(shader);
+	fs::file(fs::get_config_dir() + "shaderlog/VertexProgram" + std::to_string(id) + ".spirv", fs::rewrite).write(shader);
 
 	std::vector<u32> spir_v;
 	if (!vk::compile_glsl_to_spv(shader, glsl::glsl_vertex_program, spir_v))
@@ -354,8 +355,6 @@ void VKVertexProgram::Compile()
 
 	VkDevice dev = (VkDevice)*vk::get_current_renderer();
 	vkCreateShaderModule(dev, &vs_info, nullptr, &handle);
-
-	id = UINT32_MAX;
 }
 
 void VKVertexProgram::Delete()

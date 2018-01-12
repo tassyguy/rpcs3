@@ -4,6 +4,7 @@
 #include <QApplication>
 #include <QFontDatabase>
 #include <QCompleter>
+#include <QMenu>
 
 constexpr auto qstr = QString::fromStdString;
 extern bool user_asked_for_frame_capture;
@@ -22,6 +23,10 @@ debugger_frame::debugger_frame(std::shared_ptr<gui_settings> settings, QWidget *
 	QHBoxLayout* hbox_b_main = new QHBoxLayout();
 
 	m_list = new debugger_list(this);
+	m_breakpoints_list = new QListWidget(this);
+	m_breakpoints_list->setEditTriggers(QAbstractItemView::NoEditTriggers);
+	m_breakpoints_list->setContextMenuPolicy(Qt::CustomContextMenu);
+	m_breakpoints_list->setSelectionMode(QAbstractItemView::ExtendedSelection);
 	m_choice_units = new QComboBox(this);
 	m_choice_units->setSizeAdjustPolicy(QComboBox::AdjustToContents);
 	m_choice_units->setMaxVisibleItems(30);
@@ -33,6 +38,11 @@ debugger_frame::debugger_frame(std::shared_ptr<gui_settings> settings, QWidget *
 	m_choice_units->completer()->setMaxVisibleItems(30);
 	m_choice_units->completer()->setFilterMode(Qt::MatchContains);
 
+	m_breakpoints_list_delete = new QAction("Delete", m_breakpoints_list);
+	m_breakpoints_list_delete->setShortcut(Qt::Key_Delete);
+	m_breakpoints_list_delete->setShortcutContext(Qt::WidgetShortcut);
+	m_breakpoints_list->addAction(m_breakpoints_list_delete);
+
 	m_go_to_addr = new QPushButton(tr("Go To Address"), this);
 	m_go_to_pc = new QPushButton(tr("Go To PC"), this);
 	m_btn_capture = new QPushButton(tr("Capture"), this);
@@ -40,6 +50,7 @@ debugger_frame::debugger_frame(std::shared_ptr<gui_settings> settings, QWidget *
 	m_btn_run = new QPushButton(Run, this);
 
 	EnableButtons(!Emu.IsStopped());
+	ChangeColors();
 
 	hbox_b_main->addWidget(m_go_to_addr);
 	hbox_b_main->addWidget(m_go_to_pc);
@@ -57,9 +68,15 @@ debugger_frame::debugger_frame(std::shared_ptr<gui_settings> settings, QWidget *
 	m_list->setFont(m_mono);
 	m_regs->setFont(m_mono);
 
+	m_right_splitter = new QSplitter(this);
+	m_right_splitter->setOrientation(Qt::Vertical);
+	m_right_splitter->addWidget(m_regs);
+	m_right_splitter->addWidget(m_breakpoints_list);
+	m_right_splitter->setStretchFactor(0, 1);
+
 	m_splitter = new QSplitter(this);
 	m_splitter->addWidget(m_list);
-	m_splitter->addWidget(m_regs);
+	m_splitter->addWidget(m_right_splitter);
 
 	QHBoxLayout* hbox_w_list = new QHBoxLayout();
 	hbox_w_list->addWidget(m_splitter);
@@ -116,13 +133,28 @@ debugger_frame::debugger_frame(std::shared_ptr<gui_settings> settings, QWidget *
 	connect(m_choice_units, static_cast<void (QComboBox::*)(int)>(&QComboBox::currentIndexChanged), this, &debugger_frame::OnSelectUnit);
 	connect(this, &QDockWidget::visibilityChanged, this, &debugger_frame::EnableUpdateTimer);
 
+	connect(m_breakpoints_list, &QListWidget::itemDoubleClicked, this, &debugger_frame::OnBreakpointList_doubleClicked);
+	connect(m_breakpoints_list, &QListWidget::customContextMenuRequested, this, &debugger_frame::OnBreakpointList_rightClicked);
+	connect(m_breakpoints_list_delete, &QAction::triggered, this, &debugger_frame::OnBreakpointList_delete);
+
 	m_list->ShowAddr(CentrePc(m_list->m_pc));
 	UpdateUnitList();
 }
 
 void debugger_frame::SaveSettings()
 {
-	xgui_settings->SetValue(GUI::d_splitterState, m_splitter->saveState());
+	xgui_settings->SetValue(gui::d_splitterState, m_splitter->saveState());
+}
+
+void debugger_frame::ChangeColors()
+{
+	if (m_list)
+	{
+		m_list->m_color_bp = gui::get_Label_Color("debugger_frame_breakpoint", QPalette::Background);
+		m_list->m_color_pc = gui::get_Label_Color("debugger_frame_pc", QPalette::Background);
+		m_list->m_text_color_bp = gui::get_Label_Color("debugger_frame_breakpoint");;
+		m_list->m_text_color_pc = gui::get_Label_Color("debugger_frame_pc");;
+	}
 }
 
 void debugger_frame::closeEvent(QCloseEvent *event)
@@ -134,7 +166,7 @@ void debugger_frame::closeEvent(QCloseEvent *event)
 void debugger_frame::showEvent(QShowEvent * event)
 {
 	// resize splitter widgets
-	QByteArray state = xgui_settings->GetValue(GUI::d_splitterState).toByteArray();
+	QByteArray state = xgui_settings->GetValue(gui::d_splitterState).toByteArray();
 
 	if (state.isEmpty()) // resize 2:1
 	{
@@ -152,7 +184,7 @@ void debugger_frame::showEvent(QShowEvent * event)
 void debugger_frame::hideEvent(QHideEvent * event)
 {
 	// save splitter state or it will resume its initial state on next show
-	xgui_settings->SetValue(GUI::d_splitterState, m_splitter->saveState());
+	xgui_settings->SetValue(gui::d_splitterState, m_splitter->saveState());
 	QDockWidget::hideEvent(event);
 }
 
@@ -182,7 +214,7 @@ u32 debugger_frame::GetPc() const
 
 u32 debugger_frame::CentrePc(u32 pc) const
 {
-	return pc/* - ((m_item_count / 2) * 4)*/;
+	return pc - ((m_list->m_item_count / 2) * 4);
 }
 
 void debugger_frame::UpdateUI()
@@ -461,7 +493,54 @@ void debugger_frame::EnableButtons(bool enable)
 
 void debugger_frame::ClearBreakpoints()
 {
+	//This is required to actually delete the breakpoints, not just visually.
+	for (std::map<u32, bool>::iterator it = g_breakpoints.begin(); it != g_breakpoints.end(); it++)
+		m_list->RemoveBreakPoint(it->first, false);
+
 	g_breakpoints.clear();
+}
+
+void debugger_frame::OnBreakpointList_doubleClicked()
+{
+	m_list->ShowAddr(CentrePc(m_breakpoints_list->currentItem()->data(Qt::UserRole).value<u32>()));
+	m_list->setCurrentRow(16);
+}
+
+void debugger_frame::OnBreakpointList_rightClicked(const QPoint &pos)
+{
+	if (m_breakpoints_list->itemAt(pos) == NULL)
+		return;
+
+	QMenu* menu = new QMenu();
+
+	if (m_breakpoints_list->selectedItems().count() == 1)
+	{
+		menu->addAction("Rename");
+		menu->addSeparator();
+	}
+	menu->addAction(m_breakpoints_list_delete);
+
+	QAction* selectedItem = menu->exec(QCursor::pos());
+	if (selectedItem != NULL)
+	{
+		if (selectedItem->text() == "Rename")
+		{
+			QListWidgetItem* currentItem = m_breakpoints_list->selectedItems().at(0);
+
+			currentItem->setFlags(currentItem->flags() | Qt::ItemIsEditable);
+			m_breakpoints_list->editItem(currentItem);
+		}
+	}
+}
+
+void debugger_frame::OnBreakpointList_delete()
+{
+	int selectedCount = m_breakpoints_list->selectedItems().count();
+
+	for (int i = selectedCount - 1; i >= 0; i--)
+	{
+		m_list->RemoveBreakPoint(m_breakpoints_list->item(i)->data(Qt::UserRole).value<u32>());
+	}
 }
 
 debugger_list::debugger_list(debugger_frame* parent) : QListWidget(parent)
@@ -501,18 +580,21 @@ void debugger_list::ShowAddr(u32 addr)
 
 			item(i)->setText((IsBreakPoint(m_pc) ? ">>> " : "    ") + qstr(m_debugFrame->m_disasm->last_opcode));
 
-			QColor colour;
-			
 			if (test(cpu->state & cpu_state_pause) && m_pc == m_debugFrame->GetPc())
 			{
-				colour = QColor(Qt::green);
+				item(i)->setTextColor(m_text_color_pc);
+				item(i)->setBackgroundColor(m_color_pc);
+			}
+			else if (IsBreakPoint(m_pc))
+			{
+				item(i)->setTextColor(m_text_color_bp);
+				item(i)->setBackgroundColor(m_color_bp);
 			}
 			else
 			{
-				colour = QColor(IsBreakPoint(m_pc) ? Qt::yellow : Qt::white);
+				item(i)->setTextColor(palette().color(foregroundRole()));
+				item(i)->setBackgroundColor(palette().color(backgroundRole()));
 			}
-			
-			item(i)->setBackgroundColor(colour);
 		}
 	}
 
@@ -528,12 +610,47 @@ void debugger_list::AddBreakPoint(u32 pc)
 {
 	g_breakpoints.emplace(pc, false);
 	ppu_breakpoint(pc);
+
+	const auto cpu = m_debugFrame->cpu.lock();
+	const u32 cpu_offset = g_system == system_type::ps3 && cpu->id_type() != 1 ? static_cast<SPUThread&>(*cpu).offset : 0;
+	m_debugFrame->m_disasm->offset = (u8*)vm::base(cpu_offset);
+
+	m_debugFrame->m_disasm->disasm(m_debugFrame->m_disasm->dump_pc = pc);
+
+	QString breakpointItemText = qstr(m_debugFrame->m_disasm->last_opcode);
+
+	breakpointItemText.remove(10, 13);
+
+	QListWidgetItem* breakpointItem = new QListWidgetItem(breakpointItemText);
+	breakpointItem->setTextColor(m_text_color_bp);
+	breakpointItem->setBackgroundColor(m_color_bp);
+	QVariant pcVariant;
+	pcVariant.setValue(pc);
+	breakpointItem->setData(Qt::UserRole, pcVariant);
+	m_debugFrame->m_breakpoints_list->addItem(breakpointItem);
 }
 
-void debugger_list::RemoveBreakPoint(u32 pc)
+void debugger_list::RemoveBreakPoint(u32 pc, bool eraseFromMap)
 {
-	g_breakpoints.erase(pc);
+	if(eraseFromMap)
+		g_breakpoints.erase(pc);
 	ppu_breakpoint(pc);
+
+	int breakpointsListCount = m_debugFrame->m_breakpoints_list->count();
+
+	for (int i = 0; i < breakpointsListCount; i++)
+	{
+		QListWidgetItem* currentItem = m_debugFrame->m_breakpoints_list->item(i);
+
+		if (currentItem->data(Qt::UserRole).value<u32>() == pc)
+		{
+			delete m_debugFrame->m_breakpoints_list->takeItem(i);
+			break;
+		}
+	}
+
+	ShowAddr(m_pc - (m_item_count) * 4);
+
 }
 
 void debugger_list::keyPressEvent(QKeyEvent* event)
@@ -571,14 +688,12 @@ void debugger_list::keyPressEvent(QKeyEvent* event)
 		{
 			instruction_editor_dialog* dlg = new instruction_editor_dialog(this, pc, cpu, m_debugFrame->m_disasm.get());
 			dlg->show();
-			m_debugFrame->DoUpdate();
 			return;
 		}
 		case Qt::Key_R:
 		{
 			register_editor_dialog* dlg = new register_editor_dialog(this, pc, cpu, m_debugFrame->m_disasm.get());
 			dlg->show();
-			m_debugFrame->DoUpdate();
 			return;
 		}
 		}

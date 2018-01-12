@@ -3,6 +3,8 @@
 #include "Emu/System.h"
 #include "Emu/IdManager.h"
 #include "Emu/Cell/RawSPUThread.h"
+#include "Emu/Cell/lv2/sys_mmapper.h"
+#include "Emu/Cell/lv2/sys_event.h"
 #include "Thread.h"
 #include <typeinfo>
 
@@ -14,6 +16,12 @@
 #ifdef __APPLE__
 #define _XOPEN_SOURCE
 #define __USE_GNU
+#include <mach/thread_act.h>
+#include <mach/thread_policy.h>
+#endif
+#if defined(__DragonFly__) || defined(__FreeBSD__)
+#include <pthread_np.h>
+#define cpu_set_t cpuset_t
 #endif
 #include <errno.h>
 #include <signal.h>
@@ -29,32 +37,6 @@ thread_local u64 g_tls_fault_all = 0;
 thread_local u64 g_tls_fault_rsx = 0;
 thread_local u64 g_tls_fault_spu = 0;
 
-static void report_fatal_error(const std::string& msg)
-{
-	static semaphore<> g_report_only_once;
-
-	g_report_only_once.wait();
-
-	std::string _msg = msg + "\n"
-		"HOW TO REPORT ERRORS: https://github.com/RPCS3/rpcs3/wiki/How-to-ask-for-Support\n"
-		"Please, don't send incorrect reports. Thanks for understanding.\n";
-
-#ifdef _WIN32
-	_msg += "\nPress Yes or Enter to visit the URL above immediately.";
-	const std::size_t buf_size = _msg.size() + 1;
-	const int size = static_cast<int>(buf_size);
-	std::unique_ptr<wchar_t[]> buffer(new wchar_t[buf_size]);
-	MultiByteToWideChar(CP_UTF8, 0, _msg.c_str(), size, buffer.get(), size);
-
-	if (MessageBoxW(0, buffer.get(), L"Fatal error", MB_ICONERROR | MB_YESNO) == IDYES)
-	{
-		ShellExecuteW(0, L"open", L"https://github.com/RPCS3/rpcs3/wiki/How-to-ask-for-Support", 0, 0, SW_SHOWNORMAL);
-	}
-#else
-	std::printf("Fatal error: \n%s", _msg.c_str());
-#endif
-}
-
 [[noreturn]] void catch_all_exceptions()
 {
 	try
@@ -69,8 +51,6 @@ static void report_fatal_error(const std::string& msg)
 	{
 		report_fatal_error("Unhandled exception (unknown)");
 	}
-
-	std::abort();
 }
 
 enum x64_reg_t : u32
@@ -983,8 +963,8 @@ bool put_x64_reg_value(x64_context* context, x64_reg_t reg, size_t d_size, u64 v
 		// save the value into x64 register
 		switch (d_size)
 		{
-		case 1: *X64REG(context, reg - X64R_RAX) = value & 0xff | *X64REG(context, reg - X64R_RAX) & 0xffffff00; return true;
-		case 2: *X64REG(context, reg - X64R_RAX) = value & 0xffff | *X64REG(context, reg - X64R_RAX) & 0xffff0000; return true;
+		case 1: *X64REG(context, reg - X64R_RAX) = (value & 0xff) | (*X64REG(context, reg - X64R_RAX) & 0xffffff00); return true;
+		case 2: *X64REG(context, reg - X64R_RAX) = (value & 0xffff) | (*X64REG(context, reg - X64R_RAX) & 0xffff0000); return true;
 		case 4: *X64REG(context, reg - X64R_RAX) = value & 0xffffffff; return true;
 		case 8: *X64REG(context, reg - X64R_RAX) = value; return true;
 		}
@@ -1259,9 +1239,60 @@ bool handle_access_violation(u32 addr, bool is_writing, x64_context* context)
 		return true;
 	}
 
-	// TODO: allow recovering from a page fault as a feature of PS3 virtual memory
 	if (cpu)
 	{
+		if (fxm::check<page_fault_notification_entries>())
+		{
+			for (const auto& entry : fxm::get<page_fault_notification_entries>()->entries)
+			{
+				auto mem = vm::get(vm::any, entry.start_addr);
+				if (!mem)
+				{
+					continue;
+				}
+				if (entry.start_addr <= addr && addr <= addr + mem->size - 1)
+				{
+					// Place the page fault event onto table so that other functions [sys_mmapper_free_address and ppu pagefault funcs] 
+					// know that this thread is page faulted and where.
+
+					auto pf_entries = fxm::get_always<page_fault_event_entries>();
+					{
+						semaphore_lock pf_lock(pf_entries->pf_mutex);
+						page_fault_event pf_event{ cpu->id, addr };
+						pf_entries->events.emplace_back(pf_event);
+					}
+
+					// Now, we notify the game that a page fault occurred so it can rectify it.
+					// Note, for data3, were the memory readable AND we got a page fault, it must be due to a write violation since reads are allowed.
+					be_t<u64> data1 = addr;
+					be_t<u64> data2 = (SYS_MEMORY_PAGE_FAULT_TYPE_PPU_THREAD << 32) + cpu->id; // TODO: fix hack for now that assumes PPU thread always.
+					be_t<u64> data3 = vm::check_addr(addr, a_size, vm::page_readable) ? SYS_MEMORY_PAGE_FAULT_CAUSE_READ_ONLY : SYS_MEMORY_PAGE_FAULT_CAUSE_NON_MAPPED;
+
+					LOG_ERROR(MEMORY, "Page_fault %s location 0x%x because of %s memory", is_writing ? "writing" : "reading",
+						addr, data3 == SYS_MEMORY_PAGE_FAULT_CAUSE_READ_ONLY ? "writing read-only" : "using unmapped");
+
+					error_code sending_error = sys_event_port_send(entry.port_id, data1, data2, data3);
+					
+					// If we fail due to being busy, wait a bit and try again.
+					while (sending_error == CELL_EBUSY)
+					{
+						lv2_obj::sleep(*cpu, 1000);
+						thread_ctrl::wait_for(1000);
+						sending_error = sys_event_port_send(entry.port_id, data1, data2, data3);
+					}
+					
+					if (sending_error)
+					{
+						fmt::throw_exception("Unknown error %x while trying to pass page fault.", sending_error.value);
+					}
+
+					lv2_obj::sleep(*cpu);
+					thread_ctrl::wait();
+					return true;
+				}
+			}
+		}
+
 		LOG_FATAL(MEMORY, "Access violation %s location 0x%x", is_writing ? "writing" : "reading", addr);
 		cpu->state += cpu_flag::dbg_pause;
 		cpu->check_state();
@@ -1438,13 +1469,11 @@ const bool s_exception_handler_set = []() -> bool
 	if (!AddVectoredExceptionHandler(1, (PVECTORED_EXCEPTION_HANDLER)exception_handler))
 	{
 		report_fatal_error("AddVectoredExceptionHandler() failed.");
-		std::abort();
 	}
 
 	if (!SetUnhandledExceptionFilter((LPTOP_LEVEL_EXCEPTION_FILTER)exception_filter))
 	{
 		report_fatal_error("SetUnhandledExceptionFilter() failed.");
-		std::abort();
 	}
 
 	return true;
@@ -1491,7 +1520,6 @@ static void signal_handler(int sig, siginfo_t* info, void* uct)
 
 	// TODO (debugger interaction)
 	report_fatal_error(fmt::format("Segfault %s location %p at %p.", cause, info->si_addr, RIP(context)));
-	std::abort();
 }
 
 const bool s_exception_handler_set = []() -> bool
@@ -1715,7 +1743,7 @@ bool thread_ctrl::_wait_for(u64 usec)
 			}
 		}
 	}
-	while (_this->m_cond.wait(_lock, std::exchange(usec, usec == -1 ? -1 : 0)));
+	while (_this->m_cond.wait(_lock, std::exchange(usec, usec > cond_variable::max_timeout ? -1 : 0)));
 
 	// Timeout
 	return false;
@@ -1831,20 +1859,30 @@ void thread_ctrl::set_native_priority(int priority)
 	HANDLE _this_thread = GetCurrentThread();
 	INT native_priority = THREAD_PRIORITY_NORMAL;
 
-	switch (priority)
-	{
-	default:
-	case 0:
-		break;
-	case 1:
+	if (priority > 0)
 		native_priority = THREAD_PRIORITY_ABOVE_NORMAL;
-		break;
-	case -1:
+	if (priority < 0)
 		native_priority = THREAD_PRIORITY_BELOW_NORMAL;
-		break;
-	}
 
-	SetThreadPriority(_this_thread, native_priority);
+	if (!SetThreadPriority(_this_thread, native_priority))
+	{
+		LOG_ERROR(GENERAL, "SetThreadPriority() failed: 0x%x", GetLastError());
+	}
+#else
+	int policy;
+	struct sched_param param;
+
+	pthread_getschedparam(pthread_self(), &policy, &param);
+
+	if (priority > 0)
+		param.sched_priority = sched_get_priority_max(policy);
+	if (priority < 0)
+		param.sched_priority = sched_get_priority_min(policy);
+
+	if (int err = pthread_setschedparam(pthread_self(), policy, &param))
+	{
+		LOG_ERROR(GENERAL, "pthraed_setschedparam() failed: %d", err);
+	}
 #endif
 }
 
@@ -1853,6 +1891,15 @@ void thread_ctrl::set_ideal_processor_core(int core)
 #ifdef _WIN32
 	HANDLE _this_thread = GetCurrentThread();
 	SetThreadIdealProcessor(_this_thread, core);
+#elif __APPLE__
+	thread_affinity_policy_data_t policy = { static_cast<integer_t>(core) };
+	thread_port_t mach_thread = pthread_mach_thread_np(pthread_self());
+	thread_policy_set(mach_thread, THREAD_AFFINITY_POLICY, (thread_policy_t)&policy, 1);
+#elif defined(__linux__) || defined(__DragonFly__) || defined(__FreeBSD__)
+	cpu_set_t cs;
+	CPU_ZERO(&cs);
+	CPU_SET(core, &cs);
+	pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cs);
 #endif
 }
 

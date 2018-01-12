@@ -124,7 +124,8 @@ struct ppu_linkage_info
 	{
 		struct info
 		{
-			bool hle = false;
+			ppu_static_function* static_func = nullptr;
+			ppu_static_variable* static_var = nullptr;
 			u32 export_addr = 0;
 			std::set<u32> imports;
 			std::set<u32> frefss;
@@ -248,7 +249,7 @@ static void ppu_initialize_modules(const std::shared_ptr<ppu_linkage_info>& link
 		&ppu_module_manager::sceNpTus,
 		&ppu_module_manager::sceNpUtil,
 		&ppu_module_manager::sys_io,
-		&ppu_module_manager::libnet,
+		&ppu_module_manager::sys_net,
 		&ppu_module_manager::sysPrxForUser,
 		&ppu_module_manager::sys_libc,
 		&ppu_module_manager::sys_lv2dbg,
@@ -315,8 +316,9 @@ static void ppu_initialize_modules(const std::shared_ptr<ppu_linkage_info>& link
 			{
 				auto& flink = linkage.functions[function.first];
 
-				flink.hle = true;
+				flink.static_func = &function.second;
 				flink.export_addr = ppu_function_manager::addr + 8 * function.second.index;
+				function.second.export_addr = &flink.export_addr;
 			}
 		}
 
@@ -364,8 +366,9 @@ static void ppu_initialize_modules(const std::shared_ptr<ppu_linkage_info>& link
 			{
 				auto& vlink = linkage.variables[variable.first];
 
-				vlink.hle = true;
-				vlink.export_addr = variable.second.var->addr();
+				vlink.static_var = &variable.second;
+				vlink.export_addr = variable.second.addr;
+				variable.second.export_addr = &vlink.export_addr;
 			}
 		}
 	}
@@ -518,7 +521,12 @@ static auto ppu_load_exports(const std::shared_ptr<ppu_linkage_info>& link, u32 
 			// Function linkage info
 			auto& flink = mlink.functions[fnid];
 
-			if (flink.export_addr && !flink.hle)
+			if (flink.static_func && flink.export_addr == ppu_function_manager::addr + 8 * flink.static_func->index)
+			{
+				flink.export_addr = 0;
+			}
+
+			if (flink.export_addr)
 			{
 				LOG_ERROR(LOADER, "Already linked function '%s' in module '%s'", ppu_get_function_name(module_name, fnid), module_name);
 			}
@@ -552,7 +560,6 @@ static auto ppu_load_exports(const std::shared_ptr<ppu_linkage_info>& link, u32 
 				{
 					// Set exported function
 					flink.export_addr = faddr;
-					flink.hle = false;
 
 					// Fix imports
 					for (const u32 addr : flink.imports)
@@ -582,7 +589,12 @@ static auto ppu_load_exports(const std::shared_ptr<ppu_linkage_info>& link, u32 
 			// Variable linkage info
 			auto& vlink = mlink.variables[vnid];
 
-			if (vlink.export_addr && !vlink.hle)
+			if (vlink.static_var && vlink.export_addr == vlink.static_var->addr)
+			{
+				vlink.export_addr = 0;
+			}
+
+			if (vlink.export_addr)
 			{
 				LOG_ERROR(LOADER, "Already linked variable '%s' in module '%s'", ppu_get_variable_name(module_name, vnid), module_name);
 			}
@@ -590,7 +602,6 @@ static auto ppu_load_exports(const std::shared_ptr<ppu_linkage_info>& link, u32 
 			{
 				// Set exported variable
 				vlink.export_addr = vaddr;
-				vlink.hle = false;
 
 				// Fix imports
 				for (const auto vref : vlink.imports)
@@ -953,6 +964,23 @@ void ppu_unload_prx(const lv2_prx& prx)
 		pinfo->frefss.erase(imp.first);
 		pinfo->imports.erase(imp.first);
 	}
+
+	//for (auto& exp : prx.exports)
+	//{
+	//	auto pinfo = static_cast<ppu_linkage_info::module::info*>(exp.second);
+	//	if (pinfo->static_func)
+	//	{
+	//		pinfo->export_addr = ppu_function_manager::addr + 8 * pinfo->static_func->index;
+	//	}
+	//	else if (pinfo->static_var)
+	//	{
+	//		pinfo->export_addr = pinfo->static_var->addr;
+	//	}
+	//	else
+	//	{
+	//		pinfo->export_addr = 0;
+	//	}
+	//}
 
 	for (auto& seg : prx.segs)
 	{
@@ -1317,7 +1345,7 @@ void ppu_load_exec(const ppu_exec_object& elf)
 			}
 		}
 	}
-	
+
 	if (!load_libs.empty())
 	{
 		const std::string lle_dir = vfs::get("/dev_flash/sys/external/");
@@ -1396,6 +1424,18 @@ void ppu_load_exec(const ppu_exec_object& elf)
 		std::memcpy(vm::base(arg_addr), arg.data(), arg_size);
 
 		*args++ = arg_addr;
+	}
+
+	// Fix primary stack size
+	switch (primary_stacksize)
+	{
+	case 0x10: primary_stacksize = 32 * 1024; break; // SYS_PROCESS_PRIMARY_STACK_SIZE_32K
+	case 0x20: primary_stacksize = 64 * 1024; break; // SYS_PROCESS_PRIMARY_STACK_SIZE_64K
+	case 0x30: primary_stacksize = 96 * 1024; break; // SYS_PROCESS_PRIMARY_STACK_SIZE_96K
+	case 0x40: primary_stacksize = 128 * 1024; break; // SYS_PROCESS_PRIMARY_STACK_SIZE_128K
+	case 0x50: primary_stacksize = 256 * 1024; break; // SYS_PROCESS_PRIMARY_STACK_SIZE_256K
+	case 0x60: primary_stacksize = 512 * 1024; break; // SYS_PROCESS_PRIMARY_STACK_SIZE_512K
+	case 0x70: primary_stacksize = 1024 * 1024; break; // SYS_PROCESS_PRIMARY_STACK_SIZE_1M
 	}
 
 	// Initialize main thread

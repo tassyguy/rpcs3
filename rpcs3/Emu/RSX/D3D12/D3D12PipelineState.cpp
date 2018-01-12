@@ -54,7 +54,7 @@ void D3D12GSRender::load_program()
 	};
 
 	get_current_vertex_program();
-	get_current_fragment_program(rtt_lookup_func);
+	get_current_fragment_program_legacy(rtt_lookup_func);
 
 	if (!current_fragment_program.valid)
 		return;
@@ -315,5 +315,11 @@ void D3D12GSRender::load_program()
 std::pair<std::string, std::string> D3D12GSRender::get_programs() const
 {
 	return std::make_pair(m_pso_cache.get_transform_program(current_vertex_program).content, m_pso_cache.get_shader_program(current_fragment_program).content);
+}
+
+void D3D12GSRender::notify_tile_unbound(u32 tile)
+{
+	u32 addr = rsx::get_address(tiles[tile].offset, tiles[tile].location);
+	m_rtts.invalidate_surface_address(addr, false);
 }
 #endif

@@ -36,6 +36,7 @@ class debugger_frame : public QDockWidget
 	Q_OBJECT
 
 	debugger_list* m_list;
+	QSplitter* m_right_splitter;
 	QFont m_mono;
 	QTextEdit* m_regs;
 	QPushButton* m_go_to_addr;
@@ -61,13 +62,17 @@ class debugger_frame : public QDockWidget
 
 	std::shared_ptr<gui_settings> xgui_settings;
 
+	QAction* m_breakpoints_list_delete;
+
 public:
 	std::unique_ptr<CPUDisAsm> m_disasm;
+	QListWidget* m_breakpoints_list;
 	std::weak_ptr<cpu_thread> cpu;
 
 public:
 	explicit debugger_frame(std::shared_ptr<gui_settings> settings, QWidget *parent = 0);
 	void SaveSettings();
+	void ChangeColors();
 
 	void UpdateUI();
 	void UpdateUnitList();
@@ -92,6 +97,9 @@ Q_SIGNALS:
 public Q_SLOTS:
 	void DoStep();
 private Q_SLOTS:
+	void OnBreakpointList_doubleClicked();
+	void OnBreakpointList_rightClicked(const QPoint &pos);
+	void OnBreakpointList_delete();
 	void OnSelectUnit();
 	void Show_Val();
 	void Show_PC();
@@ -108,15 +116,19 @@ public:
 	u32 m_pc;
 	u32 m_item_count;
 	bool m_no_thread_selected;
+	QColor m_color_bp;
+	QColor m_color_pc;
+	QColor m_text_color_bp;
+	QColor m_text_color_pc;
 
 public:
 	debugger_list(debugger_frame* parent);
 	void ShowAddr(u32 addr);
+	void RemoveBreakPoint(u32 pc, bool eraseFromMap = true);
 
 private:
 	bool IsBreakPoint(u32 pc);
 	void AddBreakPoint(u32 pc);
-	void RemoveBreakPoint(u32 pc);
 
 protected:
 	void keyPressEvent(QKeyEvent* event);
@@ -124,3 +136,5 @@ protected:
 	void wheelEvent(QWheelEvent* event);
 	void resizeEvent(QResizeEvent* event);
 };
+
+Q_DECLARE_METATYPE(u32);

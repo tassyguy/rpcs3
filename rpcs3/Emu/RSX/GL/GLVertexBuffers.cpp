@@ -51,7 +51,7 @@ namespace
 		u32 block_sz = vertex_draw_count * type_size;
 
 		gsl::span<gsl::byte> dst{ reinterpret_cast<gsl::byte*>(ptr), ::narrow<u32>(block_sz) };
-		std::tie(min_index, max_index) = write_index_array_data_to_buffer(dst, raw_index_buffer,
+		std::tie(min_index, max_index, vertex_draw_count) = write_index_array_data_to_buffer(dst, raw_index_buffer,
 			type, draw_mode, rsx::method_registers.restart_index_enabled(), rsx::method_registers.restart_index(), first_count_commands,
 			[](auto prim) { return !gl::is_primitive_native(prim); });
 
@@ -133,6 +133,12 @@ namespace
 			std::tie(min_index, max_index, index_count) = upload_index_buffer(
 			    command.raw_index_buffer, ptr, type, rsx::method_registers.current_draw_clause.primitive,
 			    rsx::method_registers.current_draw_clause.first_count_commands, vertex_count);
+
+			if (min_index >= max_index)
+			{
+				//empty set, do not draw
+				return{ 0, 0, 0, 0, std::make_tuple(get_index_type(type), offset_in_index_buffer) };
+			}
 
 			//check for vertex arrays with frquency modifiers
 			for (auto &block : m_vertex_layout.interleaved_blocks)

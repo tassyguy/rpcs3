@@ -25,7 +25,7 @@ void msg_dialog_frame::Create(const std::string& msg)
 	m_dialog = new custom_dialog(type.disable_cancel);
 	m_dialog->setWindowTitle(type.se_normal ? "Normal dialog" : "Error dialog");
 	m_dialog->setWindowFlags(m_dialog->windowFlags() & ~Qt::WindowContextHelpButtonHint);
-	m_dialog->setWindowOpacity(type.bg_invisible ? 1.0 : 192.0 / 255.0);
+	m_dialog->setWindowOpacity(type.bg_invisible ? 1. : 0.75);
 
 	m_text = new QLabel(qstr(msg));
 	m_text->setAlignment(Qt::AlignCenter);
@@ -336,6 +336,14 @@ msg_dialog_frame::~msg_dialog_frame()
 	if (m_osk_dialog)
 	{
 		m_osk_dialog->deleteLater();
+	}
+}
+
+void msg_dialog_frame::SetMsg(const std::string& msg)
+{
+	if (m_dialog)
+	{
+		m_text->setText(qstr(msg));
 	}
 }
 

@@ -53,6 +53,8 @@ bool verify_mself(u32 fd, fs::file const& mself_file)
 		return false;
 	}
 
+	mself_file.seek(0);
+
 	return true;
 }
 
@@ -297,7 +299,7 @@ error_code sys_fs_open(vm::cptr<char> path, s32 flags, vm::ptr<u32> fd, s32 mode
 
 	if (size == 8)
 	{
-		// check for sdata 
+		// check for sdata
 		if (*casted_arg == 0x18000000010)
 		{
 			// check if the file has the NPD header, or else assume its not encrypted
@@ -315,7 +317,7 @@ error_code sys_fs_open(vm::cptr<char> path, s32 flags, vm::ptr<u32> fd, s32 mode
 				file.reset(std::move(sdata_file));
 			}
 		}
-		// edata 
+		// edata
 		else if (*casted_arg == 0x2)
 		{
 			// check if the file has the NPD header, or else assume its not encrypted
@@ -480,9 +482,10 @@ error_code sys_fs_readdir(u32 fd, vm::ptr<CellFsDirent> dir, vm::ptr<u64> nread)
 
 	if (directory->dir.read(info))
 	{
+		const std::string vfs_name = vfs::unescape(info.name);
 		dir->d_type = info.is_directory ? CELL_FS_TYPE_DIRECTORY : CELL_FS_TYPE_REGULAR;
-		dir->d_namlen = u8(std::min<size_t>(info.name.size(), CELL_FS_MAX_FS_FILE_NAME_LENGTH));
-		strcpy_trunc(dir->d_name, info.name);
+		dir->d_namlen = u8(std::min<size_t>(vfs_name.size(), CELL_FS_MAX_FS_FILE_NAME_LENGTH));
+		strcpy_trunc(dir->d_name, vfs_name);
 		*nread = sizeof(CellFsDirent);
 	}
 	else
@@ -512,6 +515,9 @@ error_code sys_fs_closedir(u32 fd)
 error_code sys_fs_stat(vm::cptr<char> path, vm::ptr<CellFsStat> sb)
 {
 	sys_fs.warning("sys_fs_stat(path=%s, sb=*0x%x)", path, sb);
+
+	if (!path)
+		return CELL_EFAULT;
 
 	const std::string local_path = vfs::get(path.get_ptr());
 
@@ -628,7 +634,7 @@ error_code sys_fs_rename(vm::cptr<char> from, vm::cptr<char> to)
 	{
 		return CELL_ENOTMOUNTED;
 	}
-	
+
 	if (local_to == "/" || local_from == "/")
 	{
 		return CELL_EPERM;
@@ -685,6 +691,12 @@ error_code sys_fs_rmdir(vm::cptr<char> path)
 error_code sys_fs_unlink(vm::cptr<char> path)
 {
 	sys_fs.warning("sys_fs_unlink(path=%s)", path);
+
+	// If path is just an empty string
+	if (!*path.get_ptr())
+	{
+		return CELL_ENOENT;
+	}
 
 	const std::string local_path = vfs::get(path.get_ptr());
 
@@ -1014,9 +1026,10 @@ error_code sys_fs_fcntl(u32 fd, u32 op, vm::ptr<void> _arg, u32 _size)
 				entry.attribute.size = info.size;
 				entry.attribute.blksize = 4096; // ???
 
+				const std::string vfs_name = vfs::unescape(info.name);
 				entry.entry_name.d_type = info.is_directory ? CELL_FS_TYPE_DIRECTORY : CELL_FS_TYPE_REGULAR;
-				entry.entry_name.d_namlen = u8(std::min<size_t>(info.name.size(), CELL_FS_MAX_FS_FILE_NAME_LENGTH));
-				strcpy_trunc(entry.entry_name.d_name, info.name);
+				entry.entry_name.d_namlen = u8(std::min<size_t>(vfs_name.size(), CELL_FS_MAX_FS_FILE_NAME_LENGTH));
+				strcpy_trunc(entry.entry_name.d_name, vfs_name);
 			}
 			else
 			{
@@ -1324,6 +1337,7 @@ error_code sys_fs_disk_free(vm::ps3::cptr<char> path, vm::ptr<u64> total_free, v
 error_code sys_fs_utime(vm::ps3::cptr<char> path, vm::ps3::cptr<CellFsUtimbuf> timep)
 {
 	sys_fs.warning("sys_fs_utime(path=%s, timep=*0x%x)", path, timep);
+	sys_fs.warning("** actime=%u, modtime=%u", timep->actime, timep->modtime);
 
 	const std::string local_path = vfs::get(path.get_ptr());
 

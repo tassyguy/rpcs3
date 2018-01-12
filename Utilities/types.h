@@ -48,7 +48,7 @@
 #define CONCATENATE_DETAIL(x, y) x ## y
 #define CONCATENATE(x, y) CONCATENATE_DETAIL(x, y)
 
-#define STRINGIZE_DETAIL(x) #x
+#define STRINGIZE_DETAIL(x) #x ""
 #define STRINGIZE(x) STRINGIZE_DETAIL(x)
 
 #define HERE "\n(in file " __FILE__ ":" STRINGIZE(__LINE__) ")"
@@ -531,6 +531,26 @@ inline u64 cntlz64(u64 arg, bool nonzero = false)
 	return _BitScanReverse64(&res, arg) || nonzero ? res ^ 63 : 64;
 #else
 	return arg || nonzero ? __builtin_clzll(arg) : 64;
+#endif
+}
+
+inline u32 cnttz32(u32 arg, bool nonzero = false)
+{
+#ifdef _MSC_VER
+	ulong res;
+	return _BitScanForward(&res, arg) || nonzero ? res : 32;
+#else
+	return arg || nonzero ? __builtin_ctzll(arg) : 32;
+#endif
+}
+
+inline u64 cnttz64(u64 arg, bool nonzero = false)
+{
+#ifdef _MSC_VER
+	ulong res;
+	return _BitScanForward64(&res, arg) || nonzero ? res : 64;
+#else
+	return arg || nonzero ? __builtin_ctzll(arg) : 64;
 #endif
 }
 

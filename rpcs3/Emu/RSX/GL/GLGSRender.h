@@ -5,10 +5,10 @@
 #include "GLTextureCache.h"
 #include "GLRenderTargets.h"
 #include "restore_new.h"
-#include "Utilities/optional.hpp"
 #include "define_new_memleakdetect.h"
 #include "GLProgramBuffer.h"
 #include "GLTextOut.h"
+#include "GLOverlays.h"
 #include "../rsx_utils.h"
 #include "../rsx_cache.h"
 
@@ -29,67 +29,11 @@ struct work_item
 	std::mutex guard_mutex;
 
 	u32  address_to_flush = 0;
-	gl::cached_texture_section *section_to_flush = nullptr;
+	gl::texture_cache::thrashed_set section_data;
 
 	volatile bool processed = false;
 	volatile bool result = false;
 	volatile bool received = false;
-};
-
-struct occlusion_query_info
-{
-	GLuint handle;
-	GLint result;
-	GLint num_draws;
-	bool pending;
-	bool active;
-};
-
-struct zcull_statistics
-{
-	u32 zpass_pixel_cnt;
-	u32 zcull_stats;
-	u32 zcull_stats1;
-	u32 zcull_stats2;
-	u32 zcull_stats3;
-
-	void clear()
-	{
-		zpass_pixel_cnt = zcull_stats = zcull_stats1 = zcull_stats2 = zcull_stats3 = 0;
-	}
-};
-
-struct occlusion_task
-{
-	std::vector<occlusion_query_info*> task_stack;
-	occlusion_query_info* active_query = nullptr;
-	u32 pending = 0;
-
-	//Add one query to the task
-	void add(occlusion_query_info* query)
-	{
-		active_query = query;
-
-		if (task_stack.size() > 0 && pending == 0)
-			task_stack.resize(0);
-
-		const auto empty_slots = task_stack.size() - pending;
-		if (empty_slots >= 4)
-		{
-			for (auto &_query : task_stack)
-			{
-				if (_query == nullptr)
-				{
-					_query = query;
-					pending++;
-					return;
-				}
-			}
-		}
-
-		task_stack.push_back(query);
-		pending++;
-	}
 };
 
 struct driver_state
@@ -311,33 +255,6 @@ struct driver_state
 	}
 };
 
-struct sw_ring_buffer
-{
-	std::vector<u8> data;
-	u32 ring_pos = 0;
-	u32 ring_length = 0;
-
-	sw_ring_buffer(u32 size)
-	{
-		data.resize(size);
-		ring_length = size;
-	}
-
-	void* get(u32 dwords)
-	{
-		const u32 required = (dwords << 2);
-		if ((ring_pos + required) > ring_length)
-		{
-			ring_pos = 0;
-			return data.data();
-		}
-
-		void *result = data.data() + ring_pos;
-		ring_pos += required;
-		return result;
-	}
-};
-
 class GLGSRender : public GSRender
 {
 private:
@@ -376,14 +293,10 @@ private:
 	bool manually_flush_ring_buffers = false;
 
 	gl::text_writer m_text_printer;
+	gl::depth_convert_pass m_depth_converter;
 
 	std::mutex queue_guard;
 	std::list<work_item> work_queue;
-
-	bool framebuffer_status_valid = false;
-
-	rsx::gcm_framebuffer_info surface_info[rsx::limits::color_buffers_count];
-	rsx::gcm_framebuffer_info depth_surface_info;
 
 	bool flush_draw_buffers = false;
 	std::thread::id m_thread_id;
@@ -398,13 +311,11 @@ private:
 	//vaos are mandatory for core profile
 	gl::vao m_vao;
 
-	//occlusion query
-	bool zcull_surface_active = false;
-	zcull_statistics current_zcull_stats;
-	occlusion_task zcull_task_queue = {};
-
-	const u32 occlusion_query_count = 128;
-	std::array<occlusion_query_info, 128> occlusion_query_data = {};
+	std::mutex m_sampler_mutex;
+	u64 surface_store_tag = 0;
+	std::atomic_bool m_samplers_dirty = {true};
+	std::array<std::unique_ptr<rsx::sampled_image_descriptor_base>, rsx::limits::fragment_textures_count> fs_sampler_state = {};
+	std::array<std::unique_ptr<rsx::sampled_image_descriptor_base>, rsx::limits::vertex_textures_count> vs_sampler_state = {};
 
 public:
 	GLGSRender();
@@ -418,10 +329,12 @@ private:
 	rsx::vertex_input_layout m_vertex_layout = {};
 
 	void clear_surface(u32 arg);
-	void init_buffers(bool skip_reading = false);
+	void init_buffers(rsx::framebuffer_creation_context context, bool skip_reading = false);
 
 	bool check_program_state();
 	void load_program(u32 vertex_base, u32 vertex_count);
+
+	void update_draw_state();
 
 public:
 	void read_buffers();
@@ -429,12 +342,14 @@ public:
 	void set_viewport();
 
 	void synchronize_buffers();
-	work_item& post_flush_request(u32 address, gl::cached_texture_section *section);
+	work_item& post_flush_request(u32 address, gl::texture_cache::thrashed_set& flush_data);
 
 	bool scaled_image_from_memory(rsx::blit_src_info& src_info, rsx::blit_dst_info& dst_info, bool interpolate) override;
-	
-	void check_zcull_status(bool framebuffer_swap, bool force_read);
-	u32 synchronize_zcull_stats(bool hard_sync = false);
+
+	void begin_occlusion_query(rsx::occlusion_query_info* query) override;
+	void end_occlusion_query(rsx::occlusion_query_info* query) override;
+	bool check_occlusion_query_status(rsx::occlusion_query_info* query) override;
+	void get_occlusion_query_result(rsx::occlusion_query_info* query) override;
 
 protected:
 	void begin() override;
@@ -448,12 +363,9 @@ protected:
 
 	void do_local_task() override;
 
-	void notify_zcull_info_changed() override;
-	void clear_zcull_stats(u32 type) override;
-	u32 get_zcull_stats(u32 type) override;
-
 	bool on_access_violation(u32 address, bool is_writing) override;
 	void on_notify_memory_unmapped(u32 address_base, u32 size) override;
+	void notify_tile_unbound(u32 tile) override;
 
 	virtual std::array<std::vector<gsl::byte>, 4> copy_render_targets_to_memory() override;
 	virtual std::array<std::vector<gsl::byte>, 2> copy_depth_stencil_buffer_to_memory() override;

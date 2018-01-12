@@ -15,7 +15,7 @@ std::string GLFragmentDecompilerThread::getFloatTypeName(size_t elementCount)
 
 std::string GLFragmentDecompilerThread::getFunction(FUNCTION f)
 {
-	return gl::getFunctionImpl(f);
+	return glsl::getFunctionImpl(f);
 }
 
 std::string GLFragmentDecompilerThread::saturate(const std::string & code)
@@ -154,8 +154,8 @@ void GLFragmentDecompilerThread::insertConstants(std::stringstream & OS)
 	OS << "	float alpha_ref;\n";
 	OS << "	uint alpha_func;\n";
 	OS << "	uint fog_mode;\n";
-	OS << "	uint window_origin;\n";
-	OS << "	uint window_height;\n";
+	OS << "	float wpos_scale;\n";
+	OS << "	float wpos_bias;\n";
 	OS << "	vec4 texture_parameters[16];\n";	//sampling: x,y scaling and (unused) offsets data
 	OS << "};\n";
 }
@@ -173,34 +173,32 @@ namespace
 		case rsx::texture_dimension_extended::texture_dimension_3d:
 		case rsx::texture_dimension_extended::texture_dimension_cubemap: vec_type = "vec3";
 		}
-
-		if (prog.unnormalized_coords & (1 << index))
-			OS << "\t" << vec_type << " tex" << index << "_coord_scale = texture_parameters[" << index << "].xy / textureSize(tex" << index << ", 0);\n";
-		else
-			OS << "\t" << vec_type << " tex" << index << "_coord_scale = " << vec_type << "(1.);\n";
 	}
 
 	std::string insert_texture_fetch(const RSXFragmentProgram& prog, int index)
 	{
 		std::string tex_name = "tex" + std::to_string(index);
-		std::string coord_name = "tc" + std::to_string(index);
+		std::string coord_name = "(tc" + std::to_string(index) + " * texture_parameters[" + std::to_string(index) + "])";
 
 		switch (prog.get_texture_dimension(index))
 		{
-		case rsx::texture_dimension_extended::texture_dimension_1d: return "texture(" + tex_name + ", (" + coord_name + ".x * " + tex_name + "_coord_scale))";
-		case rsx::texture_dimension_extended::texture_dimension_2d: return "texture(" + tex_name + ", (" + coord_name + ".xy * " + tex_name + "_coord_scale))";
+		case rsx::texture_dimension_extended::texture_dimension_1d: return "texture(" + tex_name + ", " + coord_name + ".x)";
+		case rsx::texture_dimension_extended::texture_dimension_2d: return "texture(" + tex_name + ", " + coord_name + ".xy)";
 		case rsx::texture_dimension_extended::texture_dimension_3d:
-		case rsx::texture_dimension_extended::texture_dimension_cubemap: return "texture(" + tex_name + ", (" + coord_name + ".xyz * " + tex_name + "_coord_scale))";
+		case rsx::texture_dimension_extended::texture_dimension_cubemap: return "texture(" + tex_name + ", " + coord_name + ".xyz)";
 		}
 
 		fmt::throw_exception("Invalid texture dimension %d" HERE, (u32)prog.get_texture_dimension(index));
 	}
 }
 
-void GLFragmentDecompilerThread::insertMainStart(std::stringstream & OS)
+void GLFragmentDecompilerThread::insertGlobalFunctions(std::stringstream &OS)
 {
 	glsl::insert_glsl_legacy_function(OS, glsl::glsl_fragment_program);
+}
 
+void GLFragmentDecompilerThread::insertMainStart(std::stringstream & OS)
+{
 	//TODO: Generate input mask during parse stage to avoid this
 	for (const ParamType& PT : m_parr.params[PF_PARAM_IN])
 	{
@@ -251,8 +249,7 @@ void GLFragmentDecompilerThread::insertMainStart(std::stringstream & OS)
 	}
 
 	OS << "	vec4 ssa = gl_FrontFacing ? vec4(1.) : vec4(-1.);\n";
-	OS << "	vec4 wpos = gl_FragCoord;\n";
-	OS << "	if (window_origin != 0) wpos.y = window_height - wpos.y;\n";
+	OS << "	vec4 wpos = get_wpos();\n";
 
 	for (const ParamType& PT : m_parr.params[PF_PARAM_UNIFORM])
 	{

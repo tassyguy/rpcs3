@@ -18,10 +18,9 @@ std::string GLVertexDecompilerThread::getIntTypeName(size_t elementCount)
 	return "ivec4";
 }
 
-
 std::string GLVertexDecompilerThread::getFunction(FUNCTION f)
 {
-	return gl::getFunctionImpl(f);
+	return glsl::getFunctionImpl(f);
 }
 
 std::string GLVertexDecompilerThread::compareFunction(COMPARE f, const std::string &Op0, const std::string &Op1)
@@ -39,6 +38,7 @@ void GLVertexDecompilerThread::insertHeader(std::stringstream &OS)
 	OS << "	vec4 user_clip_factor[2];\n";
 	OS << "	uint transform_branch_bits;\n";
 	OS << "	uint vertex_base_index;\n";
+	OS << "	float point_size;\n";
 	OS << "	ivec4 input_attributes[16];\n";
 	OS << "};\n\n";
 }
@@ -248,6 +248,14 @@ void GLVertexDecompilerThread::insertMainEnd(std::stringstream & OS)
 
 	for (auto &i : reg_table)
 	{
+		std::string name = i.name;
+
+		if (front_back_diffuse && name == "diff_color")
+			name = "back_diff_color";
+
+		if (front_back_specular && name == "spec_color")
+			name = "back_spec_color";
+
 		if (m_parr.HasParam(PF_PARAM_NONE, "vec4", i.src_reg))
 		{
 			if (i.check_mask && (rsx_vertex_program.output_mask & i.check_mask_value) == 0)
@@ -259,15 +267,7 @@ void GLVertexDecompilerThread::insertMainEnd(std::stringstream & OS)
 			if (i.name == "front_spec_color")
 				insert_front_specular = false;
 
-			std::string name = i.name;
 			std::string condition = (!i.cond.empty()) ? "(" + i.cond + ") " : "";
-
-			if (front_back_diffuse && name == "diff_color")
-				name = "back_diff_color";
-
-			if (front_back_specular && name == "spec_color")
-				name = "back_spec_color";
-
 			if (condition.empty() || i.default_val.empty())
 			{
 				if (!condition.empty()) condition = "if " + condition;
@@ -283,7 +283,7 @@ void GLVertexDecompilerThread::insertMainEnd(std::stringstream & OS)
 		{
 			//An output was declared but nothing was written to it
 			//Set it to all ones (Atelier Escha)
-			OS << "	" << i.name << " = vec4(1.);\n";
+			OS << "	" << name << " = vec4(1.);\n";
 		}
 	}
 
@@ -295,6 +295,7 @@ void GLVertexDecompilerThread::insertMainEnd(std::stringstream & OS)
 		if (m_parr.HasParam(PF_PARAM_NONE, "vec4", "dst_reg2"))
 			OS << "	front_spec_color = dst_reg2;\n";
 
+	OS << "	gl_PointSize = point_size;\n";
 	OS << "	gl_Position = gl_Position * scale_offset_mat;\n";
 
 	//Since our clip_space is symetrical [-1, 1] we map it to linear space using the eqn:
@@ -307,12 +308,14 @@ void GLVertexDecompilerThread::insertMainEnd(std::stringstream & OS)
 	//It is therefore critical that this step is done post-transform and the result re-scaled by w
 	//SEE Naruto: UNS
 	
-	OS << "	float ndc_z = gl_Position.z / gl_Position.w;\n";
-	OS << "	ndc_z = (ndc_z * 2.) - 1.;\n";
-	OS << "	gl_Position.z = ndc_z * gl_Position.w;\n";
+	//NOTE: On GPUs, poor fp32 precision means dividing z by w, then multiplying by w again gives slightly incorrect results
+	//This equation is simplified algebraically to an addition and subreaction which gives more accurate results (Fixes flickering skybox in Dark Souls 2)
+	//OS << "	float ndc_z = gl_Position.z / gl_Position.w;\n";
+	//OS << "	ndc_z = (ndc_z * 2.) - 1.;\n";
+	//OS << "	gl_Position.z = ndc_z * gl_Position.w;\n";
+	OS << "	gl_Position.z = (gl_Position.z + gl_Position.z) - gl_Position.w;\n";
 	OS << "}\n";
 }
-
 
 void GLVertexDecompilerThread::Task()
 {

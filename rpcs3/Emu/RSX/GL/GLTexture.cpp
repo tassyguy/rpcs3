@@ -133,7 +133,7 @@ namespace gl
 	}
 
 	//Apply sampler state settings
-	void sampler_state::apply(rsx::fragment_texture& tex)
+	void sampler_state::apply(rsx::fragment_texture& tex, const rsx::sampled_image_descriptor_base* sampled_image)
 	{
 		const f32 border_color = (f32)tex.border_color() / 255;
 		const f32 border_color_array[] = { border_color, border_color, border_color, border_color };
@@ -143,7 +143,8 @@ namespace gl
 		glSamplerParameteri(samplerHandle, GL_TEXTURE_WRAP_R, wrap_mode(tex.wrap_r()));
 		glSamplerParameterfv(samplerHandle, GL_TEXTURE_BORDER_COLOR, border_color_array);
 
-		if (tex.get_exact_mipmap_count() <= 1)
+		if (sampled_image->upload_context != rsx::texture_upload_context::shader_read ||
+			tex.get_exact_mipmap_count() <= 1)
 		{
 			GLint min_filter = tex_min_filter(tex.min_filter());
 
@@ -176,8 +177,9 @@ namespace gl
 			glSamplerParameteri(samplerHandle, GL_TEXTURE_MAX_LOD, (tex.max_lod() >> 8));
 		}
 
+		f32 af_level = g_cfg.video.anisotropic_level_override > 0 ? (f32)g_cfg.video.anisotropic_level_override : max_aniso(tex.max_aniso());
+		glSamplerParameterf(samplerHandle, GL_TEXTURE_MAX_ANISOTROPY_EXT, af_level);
 		glSamplerParameteri(samplerHandle, GL_TEXTURE_MAG_FILTER, tex_mag_filter(tex.mag_filter()));
-		glSamplerParameterf(samplerHandle, GL_TEXTURE_MAX_ANISOTROPY_EXT, max_aniso(tex.max_aniso()));
 
 		const u32 texture_format = tex.format() & ~(CELL_GCM_TEXTURE_UN | CELL_GCM_TEXTURE_LN);
 		if (texture_format == CELL_GCM_TEXTURE_DEPTH16 || texture_format == CELL_GCM_TEXTURE_DEPTH24_D8)
@@ -336,7 +338,7 @@ namespace gl
 	}
 
 	void fill_texture(rsx::texture_dimension_extended dim, u16 mipmap_count, int format, u16 width, u16 height, u16 depth,
-			const std::vector<rsx_subresource_layout> &input_layouts, bool is_swizzled, GLenum gl_format, GLenum gl_type, std::vector<gsl::byte> staging_buffer)
+			const std::vector<rsx_subresource_layout> &input_layouts, bool is_swizzled, GLenum gl_format, GLenum gl_type, std::vector<gsl::byte>& staging_buffer)
 	{
 		int mip_level = 0;
 		if (is_compressed_format(format))
@@ -349,7 +351,6 @@ namespace gl
 
 		if (dim == rsx::texture_dimension_extended::texture_dimension_1d)
 		{
-			glTexStorage1D(GL_TEXTURE_1D, mipmap_count, get_sized_internal_format(format), width);
 			if (!is_compressed_format(format))
 			{
 				for (const rsx_subresource_layout &layout : input_layouts)
@@ -442,8 +443,43 @@ namespace gl
 		}
 	}
 
-	void upload_texture(const GLuint id, const u32 texaddr, const u32 gcm_format, u16 width, u16 height, u16 depth, u16 mipmaps, bool is_swizzled, rsx::texture_dimension_extended type,
-			std::vector<rsx_subresource_layout>& subresources_layout, std::pair<std::array<u8, 4>, std::array<u8, 4>>& decoded_remap, bool static_state)
+	void apply_swizzle_remap(GLenum target, const std::array<GLenum, 4>& swizzle_remap, const std::pair<std::array<u8, 4>, std::array<u8, 4>>& decoded_remap)
+	{
+		//Remapping tables; format is A-R-G-B
+		//Remap input table. Contains channel index to read color from
+		const auto remap_inputs = decoded_remap.first;
+
+		//Remap control table. Controls whether the remap value is used, or force either 0 or 1
+		const auto remap_lookup = decoded_remap.second;
+
+		GLenum remap_values[4];
+
+		for (u8 channel = 0; channel < 4; ++channel)
+		{
+			switch (remap_lookup[channel])
+			{
+			default:
+				LOG_ERROR(RSX, "Unknown remap function 0x%X", remap_lookup[channel]);
+			case CELL_GCM_TEXTURE_REMAP_REMAP:
+				remap_values[channel] = swizzle_remap[remap_inputs[channel]];
+				break;
+			case CELL_GCM_TEXTURE_REMAP_ZERO:
+				remap_values[channel] = GL_ZERO;
+				break;
+			case CELL_GCM_TEXTURE_REMAP_ONE:
+				remap_values[channel] = GL_ONE;
+				break;
+			}
+		}
+
+		glTexParameteri(target, GL_TEXTURE_SWIZZLE_A, remap_values[0]);
+		glTexParameteri(target, GL_TEXTURE_SWIZZLE_R, remap_values[1]);
+		glTexParameteri(target, GL_TEXTURE_SWIZZLE_G, remap_values[2]);
+		glTexParameteri(target, GL_TEXTURE_SWIZZLE_B, remap_values[3]);
+	}
+
+	void upload_texture(GLuint id, u32 texaddr, u32 gcm_format, u16 width, u16 height, u16 depth, u16 mipmaps, bool is_swizzled, rsx::texture_dimension_extended type,
+			const std::vector<rsx_subresource_layout>& subresources_layout, const std::pair<std::array<u8, 4>, std::array<u8, 4>>& decoded_remap, bool static_state)
 	{
 		const bool is_cubemap = type == rsx::texture_dimension_extended::texture_dimension_cubemap;
 		
@@ -453,7 +489,6 @@ namespace gl
 		const std::array<GLenum, 4>& glRemap = get_swizzle_remap(gcm_format);
 
 		GLenum target;
-		GLenum remap_values[4];
 
 		switch (type)
 		{
@@ -473,6 +508,7 @@ namespace gl
 
 		glBindTexture(target, id);
 		glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+		glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
 		glTexParameteri(target, GL_TEXTURE_BASE_LEVEL, 0);
 		glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, mipmaps - 1);
 
@@ -495,35 +531,7 @@ namespace gl
 		}
 		else
 		{
-			//Remapping tables; format is A-R-G-B
-			//Remap input table. Contains channel index to read color from 
-			const auto remap_inputs = decoded_remap.first;
-
-			//Remap control table. Controls whether the remap value is used, or force either 0 or 1
-			const auto remap_lookup = decoded_remap.second;
-
-			for (u8 channel = 0; channel < 4; ++channel)
-			{
-				switch (remap_lookup[channel])
-				{
-				default:
-					LOG_ERROR(RSX, "Unknown remap function 0x%X", remap_lookup[channel]);
-				case CELL_GCM_TEXTURE_REMAP_REMAP:
-					remap_values[channel] = glRemap[remap_inputs[channel]];
-					break;
-				case CELL_GCM_TEXTURE_REMAP_ZERO:
-					remap_values[channel] = GL_ZERO;
-					break;
-				case CELL_GCM_TEXTURE_REMAP_ONE:
-					remap_values[channel] = GL_ONE;
-					break;
-				}
-			}
-
-			glTexParameteri(target, GL_TEXTURE_SWIZZLE_A, remap_values[0]);
-			glTexParameteri(target, GL_TEXTURE_SWIZZLE_R, remap_values[1]);
-			glTexParameteri(target, GL_TEXTURE_SWIZZLE_G, remap_values[2]);
-			glTexParameteri(target, GL_TEXTURE_SWIZZLE_B, remap_values[3]);
+			apply_swizzle_remap(target, glRemap, decoded_remap);
 		}
 
 		//The rest of sampler state is now handled by sampler state objects

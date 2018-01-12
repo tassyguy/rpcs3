@@ -1,23 +1,39 @@
 ﻿#include "stdafx.h"
 #include "save_data_list_dialog.h"
 #include "save_data_info_dialog.h"
-#include "gui_settings.h"
 
 #include <QPushButton>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QMenu>
+#include <QDesktopWidget>
+#include <QApplication>
 
 constexpr auto qstr = QString::fromStdString;
 
 //Show up the savedata list, either to choose one to save/load or to manage saves.
 //I suggest to use function callbacks to give save data list or get save data entry. (Not implemented or stubbed)
-save_data_list_dialog::save_data_list_dialog(const std::vector<SaveDataEntry>& entries, s32 focusedEntry, bool is_saving, QWidget* parent)
-	: QDialog(parent), m_save_entries(entries), m_entry(-1), m_entry_label(nullptr)
+save_data_list_dialog::save_data_list_dialog(const std::vector<SaveDataEntry>& entries, s32 focusedEntry, u32 op, vm::ptr<CellSaveDataListSet> listSet, QWidget* parent)
+	: QDialog(parent), m_save_entries(entries), m_entry(selection_code::new_save), m_entry_label(nullptr)
 {
-	setWindowTitle(tr("Save Data Interface"));
-	setWindowIcon(QIcon(":/rpcs3.ico"));
+	setWindowFlags(windowFlags() & ~Qt::WindowContextHelpButtonHint);
+
+	if (op >= 8)
+	{
+		setWindowTitle(tr("Save Data Interface (Delete)"));
+	}
+	else if (op & 1)
+	{
+		setWindowTitle(tr("Save Data Interface (Load)"));
+	}
+	else
+	{
+		setWindowTitle(tr("Save Data Interface (Save)"));
+	}
+
 	setMinimumSize(QSize(400, 400));
+
+	m_gui_settings.reset(new gui_settings());
 
 	// Table
 	m_list = new QTableWidget(this);
@@ -44,12 +60,12 @@ save_data_list_dialog::save_data_list_dialog(const std::vector<SaveDataEntry>& e
 		UpdateSelectionLabel();
 	}
 
-	if (is_saving)
+	if (listSet->newData)
 	{
 		QPushButton *saveNewEntry = new QPushButton(tr("Save New Entry"), this);
 		connect(saveNewEntry, &QAbstractButton::clicked, this, [&]()
 		{
-			m_entry = -1; // Set the return properly.
+			m_entry = selection_code::new_save;
 			accept();
 		});
 		hbox_action->addWidget(saveNewEntry);
@@ -91,10 +107,9 @@ save_data_list_dialog::save_data_list_dialog(const std::vector<SaveDataEntry>& e
 		int originalIndex = m_list->item(row, 0)->data(Qt::UserRole).toInt();
 		SaveDataEntry originalEntry = m_save_entries[originalIndex];
 		QString originalDirName = qstr(originalEntry.dirName);
-		gui_settings settings(this);
-		QVariantMap currNotes = settings.GetValue(GUI::m_saveNotes).toMap();
+		QVariantMap currNotes = m_gui_settings->GetValue(gui::m_saveNotes).toMap();
 		currNotes[originalDirName] = m_list->item(row, col)->text();
-		settings.SetValue(GUI::m_saveNotes, currNotes);
+		m_gui_settings->SetValue(gui::m_saveNotes, currNotes);
 	});
 
 	m_list->setCurrentCell(focusedEntry, 0);
@@ -121,15 +136,15 @@ s32 save_data_list_dialog::GetSelection()
 	int res = result();
 	if (res == QDialog::Accepted)
 	{
-		if (m_entry == -1)
+		if (m_entry == selection_code::new_save)
 		{ // Save new entry
-			return -1;
+			return selection_code::new_save;
 		}
 		return m_list->item(m_entry, 0)->data(Qt::UserRole).toInt();
 	}
 
-	// Cancel is pressed. May promote to enum or figure out proper cellsavedata code to use later.
-	return -2;
+	// Cancel is pressed. May figure out proper cellsavedata code to use later.
+	return selection_code::canceled;
 }
 
 void save_data_list_dialog::OnSort(int logicalIndex)
@@ -166,10 +181,11 @@ void save_data_list_dialog::UpdateList()
 {
 	m_list->clearContents();
 	m_list->setRowCount((int)m_save_entries.size());
-	gui_settings settings(this);
+
+	QVariantMap currNotes = m_gui_settings->GetValue(gui::m_saveNotes).toMap();
 
 	int row = 0;
-	for (SaveDataEntry entry: m_save_entries)
+	for (const SaveDataEntry& entry: m_save_entries)
 	{
 		QString title = qstr(entry.title);
 		QString subtitle = qstr(entry.subtitle);
@@ -188,18 +204,14 @@ void save_data_list_dialog::UpdateList()
 		dirNameItem->setFlags(dirNameItem->flags() & ~Qt::ItemIsEditable);
 		m_list->setItem(row, 2, dirNameItem);
 
-		QVariantMap currNotes = settings.GetValue(GUI::m_saveNotes).toMap();
 		QTableWidgetItem* noteItem = new QTableWidgetItem();
 		noteItem->setFlags(noteItem->flags() | Qt::ItemIsEditable);
+
 		if (currNotes.contains(dirName))
 		{
 			noteItem->setText(currNotes[dirName].toString());
 		}
-		else
-		{
-			currNotes[dirName] = "";
-			settings.SetValue(GUI::m_saveNotes, currNotes);
-		}
+
 		m_list->setItem(row, 3, noteItem);
 		++row;
 	}
@@ -213,6 +225,9 @@ void save_data_list_dialog::UpdateList()
 		m_list->horizontalHeader()->height() + m_list->verticalHeader()->length() + m_list->frameWidth() * 2
 	);
 
-	resize(minimumSize().expandedTo(sizeHint() - m_list->sizeHint() + tableSize));
+	QSize preferredSize = minimumSize().expandedTo(sizeHint() - m_list->sizeHint() + tableSize);
 
+	QSize maxSize = QSize(preferredSize.width(), static_cast<int>(QApplication::desktop()->screenGeometry().height()*.6));
+
+	resize(preferredSize.boundedTo(maxSize));
 }

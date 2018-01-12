@@ -7,12 +7,15 @@
 #include "Emu/Cell/PPUCallback.h"
 
 #include "Common/BufferUtils.h"
+#include "Common/texture_cache.h"
 #include "rsx_methods.h"
+#include "rsx_utils.h"
 
 #include "Utilities/GSL.h"
 #include "Utilities/StrUtil.h"
 
 #include <thread>
+#include <fenv.h>
 
 class GSRender;
 
@@ -241,6 +244,7 @@ namespace rsx
 		};
 		m_rtts_dirty = true;
 		memset(m_textures_dirty, -1, sizeof(m_textures_dirty));
+		memset(m_vertex_textures_dirty, -1, sizeof(m_vertex_textures_dirty));
 		m_transform_constants_dirty = true;
 	}
 
@@ -339,6 +343,9 @@ namespace rsx
 
 		element_push_buffer.resize(0);
 
+		if (zcull_task_queue.active_query && zcull_task_queue.active_query->active)
+			zcull_task_queue.active_query->num_draws++;
+
 		if (capture_current_frame)
 		{
 			u32 element_count = rsx::method_registers.current_draw_clause.get_elements_count();
@@ -381,6 +388,7 @@ namespace rsx
 
 					continue;
 				}
+
 				while (Emu.IsPaused())
 					std::this_thread::sleep_for(10ms);
 
@@ -390,6 +398,10 @@ namespace rsx
 
 		// Raise priority above other threads
 		thread_ctrl::set_native_priority(1);
+		thread_ctrl::set_ideal_processor_core(0);
+
+		// Round to nearest to deal with forward/reverse scaling
+		fesetround(FE_TONEAREST);
 
 		// Deferred calls are used to batch draws together
 		u32 deferred_primitive_type = 0;
@@ -397,6 +409,9 @@ namespace rsx
 		s32 deferred_begin_end = 0;
 		std::vector<u32> deferred_stack;
 		bool has_deferred_call = false;
+
+		// Track register address faults
+		u32 mem_faults_count = 0;
 
 		auto flush_command_queue = [&]()
 		{
@@ -469,10 +484,34 @@ namespace rsx
 			//Execute backend-local tasks first
 			do_local_task();
 
-			const u32 get = ctrl->get;
+			//Wait for external pause events
+			if (external_interrupt_lock.load())
+			{
+				external_interrupt_ack.store(true);
+				while (external_interrupt_lock.load()) _mm_pause();
+			}
+
+			//Set up restore state if needed
+			if (sync_point_request)
+			{
+				if (RSXIOMem.RealAddr(internal_get))
+				{
+					//New internal get is valid, use it
+					restore_point = internal_get.load();
+				}
+				else
+				{
+					LOG_ERROR(RSX, "Could not update FIFO restore point");
+				}
+
+				sync_point_request = false;
+			}
+
+			//Now load the FIFO ctrl registers
+			ctrl->get.store(internal_get.load());
 			const u32 put = ctrl->put;
 
-			if (put == get || !Emu.IsRunning())
+			if (put == internal_get || !Emu.IsRunning())
 			{
 				if (has_deferred_call)
 					flush_command_queue();
@@ -483,67 +522,97 @@ namespace rsx
 
 			//Validate put and get registers
 			//TODO: Who should handle graphics exceptions??
-			const u32 get_address = RSXIOMem.RealAddr(get);
-			
+			const u32 get_address = RSXIOMem.RealAddr(internal_get);
+
 			if (!get_address)
 			{
-				LOG_ERROR(RSX, "Invalid FIFO queue get/put registers found, get=0x%X, put=0x%X", get, put);
+				LOG_ERROR(RSX, "Invalid FIFO queue get/put registers found, get=0x%X, put=0x%X", internal_get.load(), put);
+
+				if (mem_faults_count >= 3)
+				{
+					LOG_ERROR(RSX, "Application has failed to recover, resetting FIFO queue");
+					internal_get = restore_point.load();;
+				}
+				else
+				{
+					mem_faults_count++;
+					std::this_thread::sleep_for(10ms);
+				}
 
 				invalid_command_interrupt_raised = true;
-				ctrl->get = put;
 				continue;
 			}
 
-			const u32 cmd = ReadIO32(get);
+			const u32 cmd = ReadIO32(internal_get);
 			const u32 count = (cmd >> 18) & 0x7ff;
 
 			if ((cmd & RSX_METHOD_OLD_JUMP_CMD_MASK) == RSX_METHOD_OLD_JUMP_CMD)
 			{
 				u32 offs = cmd & 0x1ffffffc;
 				//LOG_WARNING(RSX, "rsx jump(0x%x) #addr=0x%x, cmd=0x%x, get=0x%x, put=0x%x", offs, m_ioAddress + get, cmd, get, put);
-				ctrl->get = offs;
+				internal_get = offs;
 				continue;
 			}
 			if ((cmd & RSX_METHOD_NEW_JUMP_CMD_MASK) == RSX_METHOD_NEW_JUMP_CMD)
 			{
 				u32 offs = cmd & 0xfffffffc;
 				//LOG_WARNING(RSX, "rsx jump(0x%x) #addr=0x%x, cmd=0x%x, get=0x%x, put=0x%x", offs, m_ioAddress + get, cmd, get, put);
-				ctrl->get = offs;
+				internal_get = offs;
 				continue;
 			}
 			if ((cmd & RSX_METHOD_CALL_CMD_MASK) == RSX_METHOD_CALL_CMD)
 			{
-				m_call_stack.push(get + 4);
+				m_call_stack.push(internal_get + 4);
 				u32 offs = cmd & ~3;
 				//LOG_WARNING(RSX, "rsx call(0x%x) #0x%x - 0x%x", offs, cmd, get);
-				ctrl->get = offs;
+				internal_get = offs;
 				continue;
 			}
 			if (cmd == RSX_METHOD_RETURN_CMD)
 			{
+				if (m_call_stack.size() == 0)
+				{
+					LOG_ERROR(RSX, "FIFO: RET found without corresponding CALL. Discarding queue");
+					internal_get = put;
+					continue;
+				}
+
 				u32 get = m_call_stack.top();
 				m_call_stack.pop();
 				//LOG_WARNING(RSX, "rsx return(0x%x)", get);
-				ctrl->get = get;
+				internal_get = get;
 				continue;
 			}
 			if (cmd == 0) //nop
 			{
-				ctrl->get = get + 4;
+				internal_get += 4;
 				continue;
 			}
 
 			//Validate the args ptr if the command attempts to read from it
-			const u32 args_address = RSXIOMem.RealAddr(get + 4);
+			const u32 args_address = RSXIOMem.RealAddr(internal_get + 4);
 
 			if (!args_address && count)
 			{
-				LOG_ERROR(RSX, "Invalid FIFO queue args ptr found, get=0x%X, cmd=0x%X, count=%d", get, cmd, count);
+				LOG_ERROR(RSX, "Invalid FIFO queue args ptr found, get=0x%X, cmd=0x%X, count=%d", internal_get.load(), cmd, count);
+
+				if (mem_faults_count >= 3)
+				{
+					LOG_ERROR(RSX, "Application has failed to recover, resetting FIFO queue");
+					internal_get = restore_point.load();
+				}
+				else
+				{
+					mem_faults_count++;
+					std::this_thread::sleep_for(10ms);
+				}
 
 				invalid_command_interrupt_raised = true;
-				ctrl->get = put;
 				continue;
 			}
+
+			// All good on valid memory ptrs
+			mem_faults_count = 0;
 
 			auto args = vm::ptr<u32>::make(args_address);
 			invalid_command_interrupt_raised = false;
@@ -564,6 +633,7 @@ namespace rsx
 
 				bool execute_method_call = true;
 
+				//TODO: Flatten draw calls when multidraw is not supported to simplify checking in the end() methods
 				if (supports_multidraw)
 				{
 					//TODO: Make this cleaner
@@ -682,11 +752,12 @@ namespace rsx
 			{
 				//This is almost guaranteed to be heap corruption at this point
 				//Ignore the rest of the chain
-				ctrl->get = put;
+				LOG_ERROR(RSX, "FIFO contents may be corrupted. Resetting...");
+				internal_get = restore_point.load();
 				continue;
 			}
 
-			ctrl->get = get + (count + 1) * 4;
+			internal_get += (count + 1) * 4;
 		}
 	}
 
@@ -790,24 +861,36 @@ namespace rsx
 	void thread::fill_fragment_state_buffer(void *buffer, const RSXFragmentProgram &fragment_program)
 	{
 		const u32 is_alpha_tested = rsx::method_registers.alpha_test_enabled();
-		const float alpha_ref = rsx::method_registers.alpha_ref() / 255.f;
+		const f32 alpha_ref = rsx::method_registers.alpha_ref() / 255.f;
 		const f32 fog0 = rsx::method_registers.fog_params_0();
 		const f32 fog1 = rsx::method_registers.fog_params_1();
 		const u32 alpha_func = static_cast<u32>(rsx::method_registers.alpha_func());
 		const u32 fog_mode = static_cast<u32>(rsx::method_registers.fog_equation());
-		const u32 window_origin = static_cast<u32>(rsx::method_registers.shader_window_origin());
+
+		// Generate wpos coeffecients
+		// wpos equation is now as follows:
+		// wpos.y = (frag_coord / resolution_scale) * ((window_origin!=top)?-1.: 1.) + ((window_origin!=top)? window_height : 0)
+		// wpos.x = (frag_coord / resolution_scale)
+		// wpos.zw = frag_coord.zw
+
+		const auto window_origin = rsx::method_registers.shader_window_origin();
 		const u32 window_height = rsx::method_registers.shader_window_height();
-		const float one = 1.f;
+		const f32 resolution_scale = (window_height <= (u32)g_cfg.video.min_scalable_dimension)? 1.f : rsx::get_resolution_scale();
+		const f32 wpos_scale = (window_origin == rsx::window_origin::top) ? (1.f / resolution_scale) : (-1.f / resolution_scale);
+		const f32 wpos_bias = (window_origin == rsx::window_origin::top) ? 0.f : window_height;
 
 		u32 *dst = static_cast<u32*>(buffer);
 
 		stream_vector(dst, (u32&)fog0, (u32&)fog1, is_alpha_tested, (u32&)alpha_ref);
-		stream_vector(dst + 4, alpha_func, fog_mode, window_origin, window_height);
+		stream_vector(dst + 4, alpha_func, fog_mode, (u32&)wpos_scale, (u32&)wpos_bias);
 
 		size_t offset = 8;
 		for (int index = 0; index < 16; ++index)
 		{
-			stream_vector(&dst[offset], (u32&)fragment_program.texture_pitch_scale[index], (u32&)one, 0U, 0U);
+			stream_vector(&dst[offset],
+				(u32&)fragment_program.texture_scale[index][0], (u32&)fragment_program.texture_scale[index][1],
+				(u32&)fragment_program.texture_scale[index][2], (u32&)fragment_program.texture_scale[index][3]);
+
 			offset += 4;
 		}
 	}
@@ -1030,9 +1113,9 @@ namespace rsx
 			case rsx::vertex_base_type::s32k:
 			case rsx::vertex_base_type::ub256:
 				return true;
+			default:
+				return false;
 			}
-
-			return false;
 		}
 	}
 
@@ -1280,7 +1363,7 @@ namespace rsx
 		return result;
 	}
 
-	void thread::get_current_fragment_program(std::function<std::tuple<bool, u16>(u32, fragment_texture&, bool)> get_surface_info)
+	void thread::get_current_fragment_program(const std::array<std::unique_ptr<rsx::sampled_image_descriptor_base>, rsx::limits::fragment_textures_count>& sampler_descriptors)
 	{
 		auto &result = current_fragment_program = {};
 
@@ -1291,10 +1374,13 @@ namespace rsx
 		const u32 program_location = (shader_program & 0x3) - 1;
 		const u32 program_offset = (shader_program & ~0x3);
 
-		result.offset = program_offset;
 		result.addr = vm::base(rsx::get_address(program_offset, program_location));
+		auto program_start = program_hash_util::fragment_program_utils::get_fragment_program_start(result.addr);
+
+		result.addr = ((u8*)result.addr + program_start);
+		result.offset = program_offset + program_start;
 		result.valid = true;
-		result.ctrl = rsx::method_registers.shader_control();
+		result.ctrl = rsx::method_registers.shader_control() & (CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS | CELL_GCM_SHADER_CONTROL_DEPTH_EXPORT);
 		result.unnormalized_coords = 0;
 		result.front_back_color_enabled = !rsx::method_registers.two_side_light_en();
 		result.back_color_diffuse_output = !!(rsx::method_registers.vertex_attrib_output_mask() & CELL_GCM_ATTRIB_OUTPUT_MASK_BACKDIFFUSE);
@@ -1305,10 +1391,122 @@ namespace rsx
 		result.shadow_textures = 0;
 
 		std::array<texture_dimension_extended, 16> texture_dimensions;
+		const auto resolution_scale = rsx::get_resolution_scale();
+
 		for (u32 i = 0; i < rsx::limits::fragment_textures_count; ++i)
 		{
 			auto &tex = rsx::method_registers.fragment_textures[i];
-			result.texture_pitch_scale[i] = 1.f;
+			result.texture_scale[i][0] = sampler_descriptors[i]->scale_x;
+			result.texture_scale[i][1] = sampler_descriptors[i]->scale_y;
+			result.textures_alpha_kill[i] = 0;
+			result.textures_zfunc[i] = 0;
+
+			if (!tex.enabled())
+			{
+				texture_dimensions[i] = texture_dimension_extended::texture_dimension_2d;
+			}
+			else
+			{
+				texture_dimensions[i] = sampler_descriptors[i]->image_type;
+
+				if (tex.alpha_kill_enabled())
+				{
+					//alphakill can be ignored unless a valid comparison function is set
+					const rsx::comparison_function func = (rsx::comparison_function)tex.zfunc();
+					if (func < rsx::comparison_function::always && func > rsx::comparison_function::never)
+					{
+						result.textures_alpha_kill[i] = 1;
+						result.textures_zfunc[i] = (u8)func;
+					}
+				}
+
+				const u32 texaddr = rsx::get_address(tex.offset(), tex.location());
+				const u32 raw_format = tex.format();
+
+				if (raw_format & CELL_GCM_TEXTURE_UN)
+					result.unnormalized_coords |= (1 << i);
+
+				if (sampler_descriptors[i]->is_depth_texture)
+				{
+					const u32 format = raw_format & ~(CELL_GCM_TEXTURE_LN | CELL_GCM_TEXTURE_UN);
+					switch (format)
+					{
+					case CELL_GCM_TEXTURE_A8R8G8B8:
+					case CELL_GCM_TEXTURE_D8R8G8B8:
+					case CELL_GCM_TEXTURE_A4R4G4B4:
+					case CELL_GCM_TEXTURE_R5G6B5:
+					{
+						u32 remap = tex.remap();
+						result.redirected_textures |= (1 << i);
+						result.texture_scale[i][2] = (f32&)remap;
+						break;
+					}
+					case CELL_GCM_TEXTURE_DEPTH16:
+					case CELL_GCM_TEXTURE_DEPTH24_D8:
+					case CELL_GCM_TEXTURE_DEPTH16_FLOAT:
+					{
+						const auto compare_mode = (rsx::comparison_function)tex.zfunc();
+						if (result.textures_alpha_kill[i] == 0 &&
+							compare_mode < rsx::comparison_function::always &&
+							compare_mode > rsx::comparison_function::never)
+							result.shadow_textures |= (1 << i);
+						break;
+					}
+					default:
+						LOG_ERROR(RSX, "Depth texture bound to pipeline with unexpected format 0x%X", format);
+					}
+				}
+			}
+		}
+
+		result.set_texture_dimension(texture_dimensions);
+
+		//Sanity checks
+		if (result.ctrl & CELL_GCM_SHADER_CONTROL_DEPTH_EXPORT)
+		{
+			//Check that the depth stage is not disabled
+			if (!rsx::method_registers.depth_test_enabled())
+			{
+				LOG_ERROR(RSX, "FS exports depth component but depth test is disabled (INVALID_OPERATION)");
+			}
+		}
+	}
+
+	void thread::get_current_fragment_program_legacy(std::function<std::tuple<bool, u16>(u32, fragment_texture&, bool)> get_surface_info)
+	{
+		auto &result = current_fragment_program = {};
+
+		const u32 shader_program = rsx::method_registers.shader_program_address();
+		if (shader_program == 0)
+			return;
+
+		const u32 program_location = (shader_program & 0x3) - 1;
+		const u32 program_offset = (shader_program & ~0x3);
+
+		result.addr = vm::base(rsx::get_address(program_offset, program_location));
+		auto program_start = program_hash_util::fragment_program_utils::get_fragment_program_start(result.addr);
+
+		result.addr = ((u8*)result.addr + program_start);
+		result.offset = program_offset + program_start;
+		result.valid = true;
+		result.ctrl = rsx::method_registers.shader_control() & (CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS | CELL_GCM_SHADER_CONTROL_DEPTH_EXPORT);
+		result.unnormalized_coords = 0;
+		result.front_back_color_enabled = !rsx::method_registers.two_side_light_en();
+		result.back_color_diffuse_output = !!(rsx::method_registers.vertex_attrib_output_mask() & CELL_GCM_ATTRIB_OUTPUT_MASK_BACKDIFFUSE);
+		result.back_color_specular_output = !!(rsx::method_registers.vertex_attrib_output_mask() & CELL_GCM_ATTRIB_OUTPUT_MASK_BACKSPECULAR);
+		result.front_color_diffuse_output = !!(rsx::method_registers.vertex_attrib_output_mask() & CELL_GCM_ATTRIB_OUTPUT_MASK_FRONTDIFFUSE);
+		result.front_color_specular_output = !!(rsx::method_registers.vertex_attrib_output_mask() & CELL_GCM_ATTRIB_OUTPUT_MASK_FRONTSPECULAR);
+		result.redirected_textures = 0;
+		result.shadow_textures = 0;
+
+		std::array<texture_dimension_extended, 16> texture_dimensions;
+		const auto resolution_scale = rsx::get_resolution_scale();
+
+		for (u32 i = 0; i < rsx::limits::fragment_textures_count; ++i)
+		{
+			auto &tex = rsx::method_registers.fragment_textures[i];
+			result.texture_scale[i][0] = 1.f;
+			result.texture_scale[i][1] = 1.f;
 			result.textures_alpha_kill[i] = 0;
 			result.textures_zfunc[i] = 0;
 
@@ -1345,22 +1543,35 @@ namespace rsx
 				if (surface_exists && surface_pitch)
 				{
 					if (raw_format & CELL_GCM_TEXTURE_UN)
-						result.texture_pitch_scale[i] = (float)surface_pitch / tex.pitch();
+					{
+						result.texture_scale[i][0] = (resolution_scale * (float)surface_pitch) / tex.pitch();
+						result.texture_scale[i][1] = resolution_scale;
+					}
 				}
 				else
 				{
 					std::tie(surface_exists, surface_pitch) = get_surface_info(texaddr, tex, true);
 					if (surface_exists)
 					{
-						u32 format = raw_format & ~(CELL_GCM_TEXTURE_LN | CELL_GCM_TEXTURE_UN);
+						if (raw_format & CELL_GCM_TEXTURE_UN)
+						{
+							result.texture_scale[i][0] = (resolution_scale * (float)surface_pitch) / tex.pitch();
+							result.texture_scale[i][1] = resolution_scale;
+						}
+
+						const u32 format = raw_format & ~(CELL_GCM_TEXTURE_LN | CELL_GCM_TEXTURE_UN);
 						switch (format)
 						{
 						case CELL_GCM_TEXTURE_A8R8G8B8:
 						case CELL_GCM_TEXTURE_D8R8G8B8:
 						case CELL_GCM_TEXTURE_A4R4G4B4:
 						case CELL_GCM_TEXTURE_R5G6B5:
-								result.redirected_textures |= (1 << i);
-								break;
+						{
+							u32 remap = tex.remap();
+							result.redirected_textures |= (1 << i);
+							result.texture_scale[i][2] = (f32&)remap;
+							break;
+						}
 						case CELL_GCM_TEXTURE_DEPTH16:
 						case CELL_GCM_TEXTURE_DEPTH24_D8:
 						case CELL_GCM_TEXTURE_DEPTH16_FLOAT:
@@ -1373,7 +1584,7 @@ namespace rsx
 							break;
 						}
 						default:
-								LOG_ERROR(RSX, "Depth texture bound to pipeline with unexpected format 0x%X", format);
+							LOG_ERROR(RSX, "Depth texture bound to pipeline with unexpected format 0x%X", format);
 						}
 					}
 				}
@@ -1406,7 +1617,7 @@ namespace rsx
 	{
 		for (GcmTileInfo &tile : tiles)
 		{
-			if (!tile.binded || tile.location != location)
+			if (!tile.binded || (tile.location & 1) != (location & 1))
 			{
 				continue;
 			}
@@ -1426,7 +1637,7 @@ namespace rsx
 
 		GcmTileInfo *tile = find_tile(offset, location);
 		u32 base = 0;
-		
+
 		if (tile)
 		{
 			base = offset - tile->offset;
@@ -1439,7 +1650,7 @@ namespace rsx
 	u32 thread::ReadIO32(u32 addr)
 	{
 		u32 value;
-	
+
 		if (!RSXIOMem.Read32(addr, &value))
 		{
 			fmt::throw_exception("%s(addr=0x%x): RSXIO memory not mapped" HERE, __FUNCTION__, addr);
@@ -1518,6 +1729,7 @@ namespace rsx
 		u32 volatile_offset = 0;
 		u32 persistent_offset = 0;
 
+		//NOTE: Order is important! Transient ayout is always push_buffers followed by register data
 		if (rsx::method_registers.current_draw_clause.is_immediate_draw)
 		{
 			for (const auto &info : layout.volatile_blocks)
@@ -1712,12 +1924,7 @@ namespace rsx
 				return;
 			}
 
-			for (const u8 index : layout.referenced_registers)
-			{
-				memcpy(transient, rsx::method_registers.register_vertex_info[index].data.data(), 16);
-				transient += 16;
-			}
-
+			//NOTE: Order is important! Transient ayout is always push_buffers followed by register data
 			if (draw_call.is_immediate_draw)
 			{
 				//NOTE: It is possible for immediate draw to only contain index data, so vertex data can be in persistent memory
@@ -1726,6 +1933,12 @@ namespace rsx
 					memcpy(transient, vertex_push_buffers[info.first].data.data(), info.second);
 					transient += info.second;
 				}
+			}
+
+			for (const u8 index : layout.referenced_registers)
+			{
+				memcpy(transient, rsx::method_registers.register_vertex_info[index].data.data(), 16);
+				transient += 16;
 			}
 		}
 
@@ -1774,5 +1987,193 @@ namespace rsx
 
 			skip_frame = (m_skip_frame_ctr < 0);
 		}
+	}
+
+	void thread::check_zcull_status(bool framebuffer_swap, bool force_read)
+	{
+		if (g_cfg.video.disable_zcull_queries)
+			return;
+
+		bool testing_enabled = zcull_pixel_cnt_enabled || zcull_stats_enabled;
+
+		if (framebuffer_swap)
+		{
+			zcull_surface_active = false;
+			const u32 zeta_address = m_depth_surface_info.address;
+
+			if (zeta_address)
+			{
+				//Find zeta address in bound zculls
+				for (int i = 0; i < rsx::limits::zculls_count; i++)
+				{
+					if (zculls[i].binded)
+					{
+						const u32 rsx_address = rsx::get_address(zculls[i].offset, CELL_GCM_LOCATION_LOCAL);
+						if (rsx_address == zeta_address)
+						{
+							zcull_surface_active = true;
+							break;
+						}
+					}
+				}
+			}
+		}
+
+		occlusion_query_info* query = nullptr;
+
+		if (zcull_task_queue.task_stack.size() > 0)
+			query = zcull_task_queue.active_query;
+
+		if (query && query->active)
+		{
+			if (force_read || (!zcull_rendering_enabled || !testing_enabled || !zcull_surface_active))
+			{
+				end_occlusion_query(query);
+				query->active = false;
+				query->pending = true;
+			}
+		}
+		else
+		{
+			if (zcull_rendering_enabled && testing_enabled && zcull_surface_active)
+			{
+				//Find query
+				u32 free_index = synchronize_zcull_stats();
+				query = &occlusion_query_data[free_index];
+				zcull_task_queue.add(query);
+
+				begin_occlusion_query(query);
+				query->active = true;
+				query->result = 0;
+				query->num_draws = 0;
+			}
+		}
+	}
+
+	void thread::clear_zcull_stats(u32 type)
+	{
+		if (g_cfg.video.disable_zcull_queries)
+			return;
+
+		if (type == CELL_GCM_ZPASS_PIXEL_CNT)
+		{
+			if (zcull_task_queue.active_query &&
+				zcull_task_queue.active_query->active &&
+				zcull_task_queue.active_query->num_draws > 0)
+			{
+				//discard active query results
+				check_zcull_status(false, true);
+				zcull_task_queue.active_query->pending = false;
+
+				//re-enable cull stats if stats are enabled
+				check_zcull_status(false, false);
+				zcull_task_queue.active_query->num_draws = 0;
+			}
+
+			current_zcull_stats.clear();
+		}
+	}
+
+	u32 thread::get_zcull_stats(u32 type)
+	{
+		if (g_cfg.video.disable_zcull_queries)
+			return 0u;
+
+		if (zcull_task_queue.active_query &&
+			zcull_task_queue.active_query->active &&
+			current_zcull_stats.zpass_pixel_cnt == 0 &&
+			type == CELL_GCM_ZPASS_PIXEL_CNT)
+		{
+			//The zcull unit is still bound as the read is happening and there are no results ready
+			check_zcull_status(false, true);  //close current query
+			check_zcull_status(false, false); //start new query since stat counting is still active
+		}
+
+		switch (type)
+		{
+		case CELL_GCM_ZPASS_PIXEL_CNT:
+		{
+			if (current_zcull_stats.zpass_pixel_cnt > 0)
+				return UINT16_MAX;
+
+			synchronize_zcull_stats(true);
+			return (current_zcull_stats.zpass_pixel_cnt > 0) ? UINT16_MAX : 0;
+		}
+		case CELL_GCM_ZCULL_STATS:
+		case CELL_GCM_ZCULL_STATS1:
+		case CELL_GCM_ZCULL_STATS2:
+			//TODO
+			return UINT16_MAX;
+		case CELL_GCM_ZCULL_STATS3:
+		{
+			//Some kind of inverse value
+			if (current_zcull_stats.zpass_pixel_cnt > 0)
+				return 0;
+
+			synchronize_zcull_stats(true);
+			return (current_zcull_stats.zpass_pixel_cnt > 0) ? 0 : UINT16_MAX;
+		}
+		default:
+			LOG_ERROR(RSX, "Unknown zcull stat type %d", type);
+			return 0;
+		}
+	}
+
+	u32 thread::synchronize_zcull_stats(bool hard_sync)
+	{
+		if (!zcull_rendering_enabled || zcull_task_queue.pending == 0)
+			return 0;
+
+		u32 result = UINT16_MAX;
+
+		for (auto &query : zcull_task_queue.task_stack)
+		{
+			if (query == nullptr || query->active)
+				continue;
+
+			bool status = check_occlusion_query_status(query);
+			if (status == false && !hard_sync)
+				continue;
+
+			get_occlusion_query_result(query);
+			current_zcull_stats.zpass_pixel_cnt += query->result;
+
+			query->pending = false;
+			query = nullptr;
+			zcull_task_queue.pending--;
+		}
+
+		for (u32 i = 0; i < occlusion_query_count; ++i)
+		{
+			auto &query = occlusion_query_data[i];
+			if (!query.pending && !query.active)
+			{
+				result = i;
+				break;
+			}
+		}
+
+		if (result == UINT16_MAX && !hard_sync)
+			return synchronize_zcull_stats(true);
+
+		return result;
+	}
+
+	void thread::notify_zcull_info_changed()
+	{
+		check_zcull_status(false, false);
+	}
+
+	//Pause/cont wrappers for FIFO ctrl. Never call this from rsx thread itself!
+	void thread::pause()
+	{
+		external_interrupt_lock.store(true);
+		while (!external_interrupt_ack.load()) _mm_pause();
+		external_interrupt_ack.store(false);
+	}
+
+	void thread::unpause()
+	{
+		external_interrupt_lock.store(false);
 	}
 }
